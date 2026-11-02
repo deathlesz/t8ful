@@ -1,0 +1,55 @@
+[package]
+name = "t8ful"
+description = "A fast, personal Rust coding agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "t8ful"
+path = "src/main.rs"
+
+[dependencies]
+t8ful-core.workspace = true
+t8ful-openrouter.workspace = true
+t8ful-tools.workspace = true
+t8ful-tui.workspace = true
+t8ful-sandbox.workspace = true
+t8ful-mcp.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+clap.workspace = true
+memchr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# `Flock` guards the session journal and the usage record, and it is used
+# unconditionally, so the dependency follows the same `unix` gate the code sits
+# behind rather than restricting non-Linux Unix builds.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+assert_cmd.workspace = true
+image.workspace = true
+portable-pty.workspace = true
+vt100.workspace = true
+predicates.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "process"] }
+
+[lints]
+workspace = true

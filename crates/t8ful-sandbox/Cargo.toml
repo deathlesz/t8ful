@@ -1,0 +1,28 @@
+[package]
+name = "t8ful-sandbox"
+description = "Linux planning sandbox for t8ful"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+t8ful-core.workspace = true
+async-trait.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+# Closing inherited descriptors uses `fcntl`, which is not Linux-specific, so
+# the dependency follows the same `unix` gate the module carries.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "time", "io-util"] }
+
+[lints]
+workspace = true

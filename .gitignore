@@ -1,0 +1,12 @@
+/.direnv
+target/
+
+# Build output of `nix build`; the flake is normally built with --no-link.
+/result
+
+# Local credentials: never tracked, never copied into the Nix store.
+/.env
+
+# Project-local agent configuration and skills. A checkout may carry its own
+# settings and a personal MCP server list, and neither belongs in the repository.
+/.t8ful/

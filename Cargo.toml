@@ -1,0 +1,138 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/deathlesz/t8ful"
+homepage = "https://github.com/deathlesz/t8ful"
+authors = ["deathlesz"]
+rust-version = "1.88"
+
+[workspace.dependencies]
+t8ful-core = { path = "crates/t8ful-core" }
+t8ful-openrouter = { path = "crates/t8ful-openrouter" }
+t8ful-tools = { path = "crates/t8ful-tools" }
+t8ful-tui = { path = "crates/t8ful-tui" }
+t8ful-sandbox = { path = "crates/t8ful-sandbox" }
+t8ful-mcp = { path = "crates/t8ful-mcp" }
+
+async-trait = "0.1.92"
+futures-core = "0.3.34"
+futures-util = "0.3.34"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# SKILL.md frontmatter. `serde_yaml_ng` is the maintained fork of the
+# deprecated `serde_yaml`.
+serde_yaml_ng = "0.10.0"
+thiserror = "2.0.21"
+base64 = "0.23.1"
+toml = { version = "1.1", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tokio = { version = "1.54.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "process",
+    "io-util",
+    "time",
+    "signal",
+    "fs",
+] }
+tokio-util = "0.7.20"
+# Safe process-group signalling, `waitid` (WNOWAIT), and file locks. Each crate
+# opts in behind its own target dependency: `cfg(target_os = "linux")` for the
+# signalling callers and `cfg(unix)` for `Flock`; `fs` is added per crate.
+nix = { version = "0.32.0", default-features = false, features = ["signal", "process"] }
+# reqwest 0.13 renamed the Rustls feature to `rustls`; `stream` exposes
+# `bytes_stream()`, which the SSE decoder consumes.
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls",
+    "http2",
+] }
+ratatui = "0.30.2"
+# Terminal image previews. Default features pull chafa and its system library,
+# so only the crossterm backend and the image-codec defaults are enabled.
+ratatui-image = { version = "11.0.0", default-features = false, features = [
+    "crossterm",
+    "image-defaults",
+] }
+# Decoding for TUI previews. Codec support is explicit so a terminal build does
+# not pull formats the attachment validator rejects.
+image = { version = "0.25.10", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+] }
+# Deterministic TLS trust: the bundled Mozilla root set is used instead of the
+# host certificate store, so t8ful works the same in a development shell, a Nix
+# build sandbox, and a minimal container.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+webpki-roots = "1.0.11"
+diffy = "0.5.2"
+# Model Context Protocol client. `client` supplies `ClientServiceExt` and
+# `Peer<RoleClient>`; `transport-async-rw` carries stdio JSON-RPC over a child's
+# pipes; the two streamable-HTTP features supply the remote transport and the
+# reqwest-backed worker. `server` is rmcp's default feature and is unused here,
+# and unlike 2.x nothing here enables it, so it is explicitly off: both
+# `AsyncRwTransport::new_client` and `StreamableHttpClientTransport` are
+# client-gated.
+rmcp = { version = "3.11.0", default-features = false, features = [
+    "client",
+    "transport-async-rw",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+] }
+# Header names and values for MCP `custom_headers`. The same major version rmcp
+# uses, so the types match without a conversion.
+http = "1.5.0"
+
+# Two-way substring search. Session recall scans bounded journal text for every
+# query word, and this is the same SIMD-assisted searcher the standard library's
+# matchers rely on.
+memchr = "2.8.3"
+# Hash of a project's configuration file, so a recorded trust decision is bound
+# to the content it was granted for. 0.11 is what rmcp 3 itself uses, so the
+# workspace and the SDK share one copy; `termwiz` keeps its own 0.10.
+sha2 = "0.11.1"
+anyhow = "1.0.104"
+# Markdown rendering and syntax highlighting for the TUI. syntect's fancy
+# backend is pure Rust, so no oniguruma system library is needed.
+pulldown-cmark = "0.13.6"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy", "parsing"] }
+
+# Benchmark harness for the render, wrap, and SSE paths (`cargo bench`).
+divan = "0.1.21"
+
+tempfile = "3.27.0"
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+portable-pty = "0.9.0"
+vt100 = "0.18.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# Test and iteration profile: dependencies are optimized while the workspace
+# stays cheap to rebuild, so the hermetic test suite runs quickly.
+[profile.fast]
+inherits = "dev"
+opt-level = 1
+debug = 0
+incremental = true
+
+[profile.fast.package."*"]
+opt-level = 2

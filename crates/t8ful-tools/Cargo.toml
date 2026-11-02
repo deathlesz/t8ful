@@ -1,0 +1,29 @@
+[package]
+name = "t8ful-tools"
+description = "Built-in file, edit, patch, shell, and managed-process tools for t8ful"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+t8ful-core.workspace = true
+async-trait.workspace = true
+diffy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

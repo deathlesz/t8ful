@@ -1,0 +1,35 @@
+[package]
+name = "t8ful-openrouter"
+description = "OpenRouter provider for t8ful: authentication, discovery, streaming, and errors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+t8ful-core.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
+divan.workspace = true
+
+[[bench]]
+name = "sse"
+harness = false
+
+[lints]
+workspace = true

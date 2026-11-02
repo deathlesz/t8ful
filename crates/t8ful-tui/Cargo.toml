@@ -1,0 +1,37 @@
+[package]
+name = "t8ful-tui"
+description = "Full-screen terminal frontend for t8ful"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+t8ful-core.workspace = true
+t8ful-mcp.workspace = true
+async-trait.workspace = true
+ratatui.workspace = true
+ratatui-image.workspace = true
+image.workspace = true
+pulldown-cmark.workspace = true
+serde_json.workspace = true
+syntect.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+divan.workspace = true
+
+[[bench]]
+name = "render"
+harness = false
+
+[lints]
+workspace = true
