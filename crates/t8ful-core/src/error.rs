@@ -5,7 +5,9 @@
 /// could contain sensitive data.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    #[error("missing OpenRouter credentials: set OPENROUTER_API_KEY or run /login")]
+    #[error(
+        "missing provider credentials: set OPENROUTER_API_KEY or OPENCODE_GO_API_KEY, or run /login"
+    )]
     MissingCredentials,
 
     #[error("provider authentication failed: {0}")]
@@ -18,6 +20,18 @@ pub enum ProviderError {
     RateLimited {
         message: String,
         retry_after_ms: Option<u64>,
+    },
+
+    /// The provider refused to generate because the account cannot be billed.
+    ///
+    /// `limit_source` is the provider's own name for the limit that was hit, so
+    /// the retry decision can tell a limit that frees up on its own from one
+    /// that can only be fixed by the user adding credits.
+    #[error("provider payment required: {message}")]
+    PaymentRequired {
+        message: String,
+        retry_after_ms: Option<u64>,
+        limit_source: Option<String>,
     },
 
     #[error("provider returned HTTP {status}: {message}")]

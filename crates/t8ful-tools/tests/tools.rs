@@ -3,8 +3,52 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use t8ful_core::tool::{ToolCall, ToolContext, ToolRegistry, ToolStatus};
-use t8ful_tools::{ManagedProcesses, NoSkills, builtin_registry};
+use t8ful_core::content::ImageInput;
+use t8ful_core::tool::{ToolCall, ToolContext, ToolError, ToolRegistry, ToolStatus};
+use t8ful_tools::{AttachmentStore, ManagedProcesses, NoSkills, builtin_registry};
+
+/// A store that keeps the bytes in the fixture directory.
+///
+/// The real store copies into session-owned state; for a tool test the only
+/// required behavior is that the reference outlives the call.
+#[derive(Debug, Default)]
+struct TempAttachments {
+    dir: PathBuf,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl AttachmentStore for TempAttachments {
+    fn store(&self, bytes: &[u8], max_encoded_bytes: usize) -> Result<ImageInput, ToolError> {
+        if bytes.len().div_ceil(3) * 4 > max_encoded_bytes {
+            return Err(ToolError::Failed(format!(
+                "the base64-encoded image would exceed {max_encoded_bytes} bytes"
+            )));
+        }
+
+        let sniffed = t8ful_tools::sniff_image(bytes)
+            .ok_or_else(|| ToolError::Failed("not an image".to_owned()))?;
+        let extension = match sniffed.media_type() {
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "jpg",
+        };
+        let name = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self.dir.join(format!("stored-{name}.{extension}"));
+
+        std::fs::write(&path, bytes).expect("store image");
+
+        let (width, height) = sniffed.dimensions();
+
+        Ok(ImageInput::new(
+            sniffed.media_type(),
+            path,
+            width,
+            height,
+            bytes.len() as u64,
+        ))
+    }
+}
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -21,7 +65,11 @@ impl Fixture {
     fn with_capacity(capacity: usize) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let processes = Arc::new(ManagedProcesses::new(capacity));
-        let registry = builtin_registry(Arc::clone(&processes), Arc::new(NoSkills));
+        let attachments = Arc::new(TempAttachments {
+            dir: dir.path().to_path_buf(),
+            next: std::sync::atomic::AtomicU64::new(0),
+        });
+        let registry = builtin_registry(Arc::clone(&processes), Arc::new(NoSkills), attachments);
         let mut context = ToolContext::new(dir.path().to_path_buf(), dir.path().to_path_buf());
         context.default_timeout = Duration::from_secs(20);
         context.max_output_bytes = capacity;
@@ -62,6 +110,7 @@ impl Fixture {
                 "content": output.content,
                 "truncated": output.truncated,
                 "metadata": output.metadata,
+                "images": output.images,
             })),
             Err(error) => Err(error.to_string()),
         }
@@ -455,6 +504,146 @@ async fn read_file_reports_mixed_line_endings() {
         "{}",
         content(&output)
     );
+}
+
+// ---------------------------------------------------------------------------
+// read_file: images
+// ---------------------------------------------------------------------------
+
+/// A small valid PNG of the given size.
+fn png(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+
+    bytes.extend_from_slice(&13_u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes.extend_from_slice(b"IEND");
+
+    bytes
+}
+
+#[tokio::test]
+async fn read_file_returns_a_screenshot_as_an_image_with_a_caption() {
+    let fixture = Fixture::new();
+    let bytes = png(1200, 800);
+
+    std::fs::write(fixture.path("shot.png"), &bytes).expect("write png");
+
+    let output = fixture.ok("read_file", json!({ "path": "shot.png" })).await;
+    let images = output["images"].as_array().expect("images");
+
+    assert_eq!(images.len(), 1, "{output}");
+    assert_eq!(images[0]["media_type"], json!("image/png"));
+    assert_eq!(images[0]["width"], json!(1200));
+    assert_eq!(images[0]["height"], json!(800));
+    assert_eq!(
+        std::fs::read(images[0]["path"].as_str().expect("path")).expect("stored image"),
+        bytes,
+        "the stored attachment must keep the exact bytes"
+    );
+    assert_eq!(output["metadata"]["image"], json!(true));
+    assert!(
+        content(&output).starts_with("shot.png · image/png · 1200x800 · "),
+        "the model needs a caption it can reason about: {}",
+        content(&output)
+    );
+}
+
+#[tokio::test]
+async fn read_file_keeps_the_text_error_for_a_foreign_binary() {
+    let fixture = Fixture::new();
+
+    std::fs::write(fixture.path("blob.bin"), b"\x7fELF\x02\x01\x01\x00\xff\xfe")
+        .expect("write binary");
+
+    let error = fixture
+        .fail("read_file", json!({ "path": "blob.bin" }))
+        .await;
+
+    assert!(error.contains("not valid UTF-8"), "{error}");
+}
+
+#[tokio::test]
+async fn a_truncated_image_header_is_reported_as_an_image_not_as_text() {
+    // A PNG whose IHDR is cut off is not text, and saying it is "not valid
+    // UTF-8" would send the caller looking for the wrong problem.
+    let fixture = Fixture::new();
+
+    std::fs::write(fixture.path("broken.png"), b"\x89PNG\r\n\x1a\n").expect("write png");
+
+    let error = fixture
+        .fail("read_file", json!({ "path": "broken.png" }))
+        .await;
+
+    assert!(error.contains("looks like a PNG image"), "{error}");
+    assert!(!error.contains("UTF-8"), "{error}");
+}
+
+#[tokio::test]
+async fn read_file_refuses_an_image_above_the_attachment_limit() {
+    let fixture = Fixture::new();
+
+    std::fs::write(fixture.path("big.png"), png(4, 4)).expect("write png");
+
+    // The limit bounds the encoded form the provider will build, so it is
+    // refused here as well as by the store: one rule, checked where the bytes
+    // would be read.
+    let call = ToolCall::new("call-1", "read_file", json!({ "path": "big.png" }));
+    let tool = fixture.registry.get("read_file").expect("tool registered");
+    let mut context = fixture.context.clone();
+
+    context.max_image_encoded_bytes = 4;
+
+    let error = tool
+        .execute(&call, &context)
+        .await
+        .expect_err("over the limit")
+        .to_string();
+
+    assert!(error.contains("base64-encoded image"), "{error}");
+}
+
+#[tokio::test]
+async fn read_file_refuses_an_oversized_image_before_buffering_it() {
+    // The file is larger than the sniff window, so the size check has to use the
+    // file length rather than what was already read.
+    let fixture = Fixture::new();
+    let mut bytes = png(64, 64);
+
+    bytes.resize(128 * 1024, 0);
+    std::fs::write(fixture.path("huge.png"), &bytes).expect("write png");
+
+    let call = ToolCall::new("call-1", "read_file", json!({ "path": "huge.png" }));
+    let tool = fixture.registry.get("read_file").expect("tool registered");
+    let mut context = fixture.context.clone();
+
+    context.max_image_encoded_bytes = 64 * 1024;
+
+    let error = tool
+        .execute(&call, &context)
+        .await
+        .expect_err("over the limit")
+        .to_string();
+
+    assert!(error.contains("above the configured limit"), "{error}");
+}
+
+#[tokio::test]
+async fn an_image_path_is_still_read_as_text_through_a_byte_offset() {
+    // A caller that explicitly asks for bytes gets bytes: the image path is a
+    // convenience for the common case, not a filter on the tool.
+    let fixture = Fixture::new();
+
+    std::fs::write(fixture.path("shot.png"), png(1, 1)).expect("write png");
+
+    let error = fixture
+        .fail("read_file", json!({ "path": "shot.png", "byte_offset": 0 }))
+        .await;
+
+    assert!(error.contains("not valid UTF-8"), "{error}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,12 +1394,12 @@ async fn bash_withholds_known_credentials() {
     let fixture = Fixture::new();
 
     let parent_key = std::env::var("OPENROUTER_API_KEY").ok();
-    let command =
-        "printf '%s|%s' \"${OPENROUTER_API_KEY:-missing}\" \"${T8FUL_TEST_SECRET:-missing}\"";
+    let command = "printf '%s|%s|%s' \"${OPENROUTER_API_KEY:-missing}\" \
+        \"${OPENCODE_GO_API_KEY:-missing}\" \"${T8FUL_TEST_SECRET:-missing}\"";
     let output = fixture.ok("bash", json!({ "command": command })).await;
     let rendered = content(&output);
 
-    assert!(rendered.contains("missing|missing"), "{rendered}");
+    assert!(rendered.contains("missing|missing|missing"), "{rendered}");
 
     if let Some(key) = parent_key.filter(|key| !key.is_empty()) {
         assert!(

@@ -90,10 +90,10 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/logout",
-        usage: "/logout",
-        hint: "",
-        description: "forget the saved API key",
-        values: &[],
+        usage: "/logout [provider]",
+        hint: "[provider]",
+        description: "forget a saved API key",
+        values: PROVIDERS,
     },
     CommandSpec {
         name: "/attach",
@@ -174,10 +174,16 @@ pub fn reasoning_description(effort: t8ful_core::provider::ReasoningEffort) -> &
     }
 }
 
-const PROVIDERS: &[ValueSpec] = &[ValueSpec {
-    value: "openrouter",
-    description: "OpenRouter API key",
-}];
+const PROVIDERS: &[ValueSpec] = &[
+    ValueSpec {
+        value: "openrouter",
+        description: "OpenRouter API key",
+    },
+    ValueSpec {
+        value: "opencode-go",
+        description: "OpenCode Go API key",
+    },
+];
 
 const PROCESS_ACTIONS: &[ValueSpec] = &[
     ValueSpec {
@@ -705,8 +711,14 @@ mod tests {
     #[test]
     fn a_command_plus_space_offers_its_fixed_values() {
         assert_eq!(labels("/reasoning h"), vec!["/reasoning high"]);
-        assert_eq!(labels("/login "), vec!["/login openrouter"]);
-        assert_eq!(labels("/login o"), vec!["/login openrouter"]);
+        assert_eq!(
+            labels("/login "),
+            vec!["/login openrouter", "/login opencode-go"]
+        );
+        assert_eq!(
+            labels("/login o"),
+            vec!["/login openrouter", "/login opencode-go"]
+        );
         assert_eq!(labels("/login x"), Vec::<String>::new());
     }
 

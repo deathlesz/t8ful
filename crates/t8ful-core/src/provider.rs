@@ -21,6 +21,12 @@ pub struct ProviderRequest {
     /// Provider-specific value for `reasoning` when the model maps this level
     /// to something other than the common label.
     pub reasoning_value: Option<String>,
+    /// The conversation this request belongs to.
+    ///
+    /// Providers that need a per-conversation identifier on the wire (OpenCode
+    /// Go's `x-opencode-session`) derive it from here. It is never sent as part
+    /// of the message content.
+    pub session_id: Option<String>,
 }
 
 /// Requested reasoning effort. `Default` sends no reasoning field at all.
@@ -235,6 +241,9 @@ pub enum ProviderEvent {
     ToolCallComplete(ToolCall),
     Usage(Usage),
     Finished(FinishReason),
+    /// A display-only notice from the transport, such as a retry it is about to
+    /// wait out. It never enters the conversation and is never journaled.
+    Warning(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +257,11 @@ pub enum FinishReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelInfo {
     pub id: String,
+    /// The provider this model came from, set by the layer that composed the
+    /// catalog (for example `openrouter` or `opencode-go`).
+    ///
+    /// Display and routing metadata only: it is never sent to the API.
+    pub provider: Option<String>,
     pub name: Option<String>,
     pub context_length: Option<u64>,
     /// Provider-advertised maximum output tokens, when known.

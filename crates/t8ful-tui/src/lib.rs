@@ -23,8 +23,8 @@ pub mod theme;
 pub mod ui;
 
 pub use bridge::{
-    AuthSnapshot, CatalogSnapshot, ContextSnapshot, McpSnapshot, Secret, TuiBridge, TuiCommand,
-    TuiEndpoints, bridge,
+    AuthKind, AuthSnapshot, CatalogSnapshot, ContextSnapshot, McpSnapshot, ModelRow, Secret,
+    TuiBridge, TuiCommand, TuiEndpoints, bridge,
 };
 pub use clipboard::{ClipboardError, ClipboardImage, ClipboardImageSource, SystemClipboard};
 pub use commands::{COMMANDS, CommandSpec, Completion, ValueSpec, suggestions};

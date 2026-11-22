@@ -7,6 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::content::ImageInput;
 use crate::ids::CallId;
 use crate::policy::Mode;
 use crate::provider::ReasoningEffort;
@@ -77,6 +78,14 @@ pub struct ToolResult {
     pub status: ToolStatus,
     pub content: String,
     pub truncated: bool,
+    /// Images this result carries, stored in session-owned attachment storage.
+    ///
+    /// The bytes never travel inside `content`: a chat-completions `tool`
+    /// message is text, so the transport hoists these into a user message as
+    /// `image_url` parts. `serde(default)` keeps journals written before this
+    /// field existed loading unchanged.
+    #[serde(default)]
+    pub images: Vec<ImageInput>,
 }
 
 impl ToolResult {
@@ -92,7 +101,14 @@ impl ToolResult {
             status,
             content: content.into(),
             truncated,
+            images: Vec::new(),
         }
+    }
+
+    /// Attach images the result carries for the model to see.
+    pub fn with_images(mut self, images: Vec<ImageInput>) -> Self {
+        self.images = images;
+        self
     }
 
     pub fn denied(call: &ToolCall, reason: impl Into<String>) -> Self {
@@ -348,6 +364,11 @@ pub struct ToolOutput {
     pub content: String,
     pub truncated: bool,
     pub metadata: Option<serde_json::Value>,
+    /// Images the tool returned, already in session-owned storage.
+    ///
+    /// The agent copies them onto the `ToolResult`, which is what the transport
+    /// reads when it builds the request.
+    pub images: Vec<ImageInput>,
 }
 
 impl ToolOutput {
@@ -356,11 +377,17 @@ impl ToolOutput {
             content: content.into(),
             truncated: false,
             metadata: None,
+            images: Vec::new(),
         }
     }
 
     pub fn with_truncation(mut self, truncated: bool) -> Self {
         self.truncated = truncated;
+        self
+    }
+
+    pub fn with_images(mut self, images: Vec<ImageInput>) -> Self {
+        self.images = images;
         self
     }
 }

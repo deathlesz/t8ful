@@ -9,7 +9,7 @@ t8ful gives you a full-screen TUI for interactive work and a headless CLI for sc
 - **TUI and CLI, one engine.** Full-screen dashboard with live streaming, tool cards, `@` file mentions, markdown/syntax highlighting, and terminal image previews — or `t8ful run` for streamed text and versioned JSONL.
 - **Autonomous coding mode.** Edits files, runs commands, and manages background processes without approval prompts.
 - **Sandboxed plan mode.** Exploration runs in [Bubblewrap](https://github.com/containers/bubblewrap): the host is mounted read-only with a disposable `/tmp` and no network. If the sandbox cannot start, plan mode errors instead of falling back.
-- **Reliable file and shell tools.** Exact-match atomic multi-edits, unified patch application, bounded output, managed background processes, and credential filtering for shell commands.
+- **Reliable file and shell tools.** Exact-match atomic multi-edits, unified patch application, bounded output, managed background processes, credential filtering for shell commands, and `read_file` over a screenshot returns the picture itself.
 - **Durable sessions.** Append-only JSONL journals under `$XDG_STATE_HOME/t8ful`, session picker and resume, automatic context compaction, token/cost tracking, and `recall` to search past sessions.
 - **Skills and MCP.** `SKILL.md` directories (local, Git-installed, or Nix-pinned) and local stdio or remote Streamable HTTP MCP servers (`mcp__server__tool`), referencing credentials by environment variable name only.
 - **Delegation.** A session task graph, non-blocking child agents (`spawn_agents`) with separate contexts and journals, and optional isolated Git worktrees.
@@ -19,7 +19,7 @@ t8ful gives you a full-screen TUI for interactive work and a headless CLI for sc
 
 - **Linux** (the plan-mode sandbox is Linux-specific).
 - **Rust 1.88+** to build from source, or **Nix**.
-- **An OpenRouter API key**, set via `OPENROUTER_API_KEY` or saved with `/login` (stored owner-only in `$XDG_STATE_HOME/t8ful/auth.json`).
+- **An API key** for OpenRouter (`OPENROUTER_API_KEY`), OpenCode Go (`OPENCODE_GO_API_KEY`), or both. Either can also be saved with `/login` (stored owner-only in `$XDG_STATE_HOME/t8ful/auth.json`). Both catalogs are listed together, and the model you pick decides which provider serves the request.
 - **`bwrap`** on `PATH` for plan mode (bundled by the Nix package/modules; install `bubblewrap` on other distros).
 
 ## Install
@@ -51,7 +51,8 @@ cargo build --release
 ## Quick start
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-...
+export OPENROUTER_API_KEY=sk-or-...      # and/or:
+export OPENCODE_GO_API_KEY=oc_sk-...
 t8ful
 ```
 
@@ -60,8 +61,8 @@ In the TUI:
 - `Enter` sends a prompt; `Ctrl+Q` queues a follow-up while the agent is busy.
 - `Tab` (or `/plan`, `/code`, `--mode`) switches between coding and plan mode.
 - `?` on an empty composer opens keybindings; `/help` lists slash commands.
-- `/model` switches models, `/attach` attaches images, `/sessions` and `/resume` switch conversations, `/new` starts fresh, and `/agents` / `/tasks` inspect delegation.
-- `/login` and `/logout` manage your saved OpenRouter key.
+- `/model` switches models from both providers; each row shows its source, e.g. `kimi-k3 [opencode-go]`, and `/model opencode` narrows the list to OpenCode Go. `/attach` attaches images, `/sessions` and `/resume` switch conversations, `/new` starts fresh, and `/agents` / `/tasks` inspect delegation.
+- `/login openrouter`, `/login opencode-go`, `/logout openrouter`, and `/logout opencode-go` manage the saved keys one provider at a time.
 
 Headless CLI:
 
@@ -69,7 +70,7 @@ Headless CLI:
 t8ful run "summarize the failures in tests/fixtures"     # streamed text
 t8ful run --format json "fix the build" > events.jsonl    # versioned JSONL
 t8ful run - < prompt.md                                   # prompt from stdin
-t8ful models                                              # available models
+t8ful models                                              # both catalogs, with a provider column
 t8ful sessions                                            # saved sessions
 t8ful usage                                               # token and cost totals
 t8ful skills list
@@ -98,7 +99,7 @@ Settings merge in this order (highest precedence first):
 | Layer | Source |
 | --- | --- |
 | CLI | flags (`--model`, `--mode`, `--max-steps`, …) |
-| Environment | `OPENROUTER_API_KEY`, `T8FUL_MODEL`, `T8FUL_MODE`, `T8FUL_BASE_URL`, … |
+| Environment | `OPENROUTER_API_KEY`, `OPENCODE_GO_API_KEY`, `T8FUL_MODEL`, `T8FUL_MODE`, `T8FUL_BASE_URL`, … |
 | Explicit file | `--config <path>` |
 | Project | `<project-root>/.t8ful/config.toml` |
 | User | `$XDG_CONFIG_HOME/t8ful/config.toml` (`~/.config/t8ful` by default) |

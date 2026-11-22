@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString};
 use tokio::process::Command;
 
 /// Credential variables that are always withheld, whatever the configuration says.
-pub const ALWAYS_DENIED: &[&str] = &["OPENROUTER_API_KEY"];
+pub const ALWAYS_DENIED: &[&str] = &["OPENROUTER_API_KEY", "OPENCODE_GO_API_KEY"];
 
 /// Deny list for one run.
 #[derive(Debug, Clone, Default)]
@@ -72,6 +72,7 @@ mod tests {
         let filter = EnvFilter::new(&[]);
 
         assert!(filter.denies(std::ffi::OsStr::new("OPENROUTER_API_KEY")));
+        assert!(filter.denies(std::ffi::OsStr::new("OPENCODE_GO_API_KEY")));
         assert!(!filter.denies(std::ffi::OsStr::new("PATH")));
     }
 
@@ -86,7 +87,11 @@ mod tests {
 
         assert_eq!(
             filter.denied_names(),
-            vec!["OPENROUTER_API_KEY".to_owned(), "GITHUB_TOKEN".to_owned()]
+            vec![
+                "OPENROUTER_API_KEY".to_owned(),
+                "OPENCODE_GO_API_KEY".to_owned(),
+                "GITHUB_TOKEN".to_owned()
+            ]
         );
     }
 
@@ -100,5 +105,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!names.iter().any(|name| name == "OPENROUTER_API_KEY"));
+        assert!(!names.iter().any(|name| name == "OPENCODE_GO_API_KEY"));
     }
 }

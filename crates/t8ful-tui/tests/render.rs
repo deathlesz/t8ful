@@ -335,6 +335,7 @@ fn renders_tool_headers_with_status_titles_and_output() {
         content: "file contents".to_owned(),
         truncated: true,
         process_id: None,
+        images: Vec::new(),
     });
 
     let screen = draw(&mut app, 100, 30);
@@ -363,6 +364,7 @@ fn a_recall_card_shows_the_query_and_no_model_wrapper() {
         content: content.to_owned(),
         truncated: false,
         process_id: None,
+        images: Vec::new(),
     });
 
     let screen = draw(&mut app, 100, 30);
@@ -395,6 +397,7 @@ fn long_tool_output_collapses_and_ctrl_o_expands_it() {
         content: body,
         truncated: false,
         process_id: None,
+        images: Vec::new(),
     });
 
     let collapsed = draw(&mut app, 100, 30);
@@ -437,6 +440,7 @@ fn a_failed_bash_result_shows_the_error_glyph_and_every_line() {
         content: body,
         truncated: false,
         process_id: None,
+        images: Vec::new(),
     });
 
     let screen = draw(&mut app, 100, 40);
@@ -463,6 +467,7 @@ fn a_long_bash_command_wraps_in_the_card_header() {
         content: "done".to_owned(),
         truncated: false,
         process_id: None,
+        images: Vec::new(),
     });
 
     let screen = draw(&mut app, 60, 20);
@@ -489,6 +494,7 @@ fn a_denied_tool_result_renders_in_full_and_is_not_collapsed() {
         content: body,
         truncated: false,
         process_id: None,
+        images: Vec::new(),
     });
 
     app.scroll = usize::MAX;
@@ -533,6 +539,7 @@ fn a_long_tool_result_fits_a_narrow_terminal_viewport() {
         content: body,
         truncated: false,
         process_id: None,
+        images: Vec::new(),
     });
 
     let screen = draw(&mut app, 40, 18);
@@ -1166,12 +1173,24 @@ fn the_plan_hand_off_uses_the_inline_panel() {
 }
 
 fn draw_buffer(app: &mut AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).expect("test terminal");
     let mut layout = TranscriptLayout::default();
 
+    draw_buffer_with_layout(app, &mut layout, width, height)
+}
+
+/// Draw with a caller-owned layout, so a test can drive the preview decodes
+/// between frames.
+fn draw_buffer_with_layout(
+    app: &mut AppState,
+    layout: &mut TranscriptLayout,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+
     terminal
-        .draw(|frame| render(frame, app, &mut layout))
+        .draw(|frame| render(frame, app, layout))
         .expect("draw succeeds");
 
     terminal.backend().buffer().clone()
@@ -1351,9 +1370,9 @@ fn the_model_picker_filters_and_reports_an_empty_result() {
     let mut app = state();
 
     app.models = vec![
-        "vendor/large".to_owned(),
-        "vendor/small".to_owned(),
-        "other/model".to_owned(),
+        t8ful_tui::bridge::ModelRow::new("vendor/large", None),
+        t8ful_tui::bridge::ModelRow::new("vendor/small", None),
+        t8ful_tui::bridge::ModelRow::new("other/model", None),
     ];
     app.picker = Some(0);
     app.picker_push_char('l');
@@ -1371,7 +1390,7 @@ fn the_model_picker_filters_and_reports_an_empty_result() {
 
     let mut empty = state();
 
-    empty.models = vec!["vendor/large".to_owned()];
+    empty.models = vec![t8ful_tui::bridge::ModelRow::new("vendor/large", None)];
     empty.picker = Some(0);
     empty.picker_push_char('z');
 
@@ -1704,6 +1723,7 @@ fn an_agent_tool_card_shows_the_prompt_it_was_given() {
         content: "a1 started".to_owned(),
         truncated: false,
         process_id: None,
+        images: Vec::new(),
     });
 
     let screen = draw(&mut app, 110, 30);
@@ -1773,6 +1793,233 @@ fn an_image_entry_renders_its_caption_and_a_halfblock_preview() {
 }
 
 #[test]
+fn a_tool_card_that_returned_an_image_shows_its_caption_under_the_body() {
+    // `read_file` over a screenshot produces a caption in the tool result and an
+    // image the model sees. The card has to carry both, attached to the call.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("shot.png");
+    let image = image::RgbImage::from_fn(48, 32, |x, y| {
+        image::Rgb([(x * 5) as u8, (y * 7) as u8, 90])
+    });
+
+    image.save(&path).expect("write fixture");
+
+    let bytes = std::fs::metadata(&path).expect("metadata").len();
+    let mut app = state();
+
+    app.apply_event(AgentEvent::ToolCallStarted {
+        call_id: "call-1".to_owned(),
+        tool: "read_file".to_owned(),
+        arguments: json!({ "path": "shot.png" }),
+    });
+    app.apply_event(AgentEvent::ToolResult {
+        call_id: "call-1".to_owned(),
+        tool: "read_file".to_owned(),
+        status: ToolStatus::Ok,
+        content: "shot.png · image/png · 48x32".to_owned(),
+        truncated: false,
+        process_id: None,
+        images: vec![t8ful_core::content::ImageInput::new(
+            "image/png",
+            path,
+            48,
+            32,
+            bytes,
+        )],
+    });
+
+    // A 48x32 preview needs more rows than a 30-line screen has, so the card
+    // body would be scrolled out of view.
+    let mut layout = TranscriptLayout::default();
+    let first = draw_with_layout(&mut app, &mut layout, 90, 60);
+
+    assert!(first.contains("Read shot.png"), "{first}");
+    assert!(first.contains("image/png · 48x32"), "{first}");
+
+    for _ in 0..200 {
+        if layout.apply_image_results() {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let rendered = draw_with_layout(&mut app, &mut layout, 90, 60);
+
+    assert!(!rendered.contains("decoding preview"), "{rendered}");
+    assert!(
+        rendered.chars().any(|c| matches!(c, '▀' | '▄' | '█')),
+        "the image the tool returned was never painted: {rendered}"
+    );
+    assert!(
+        rendered.find("Read shot.png") < rendered.find("image/png · 48x32"),
+        "the caption belongs under the header: {rendered}"
+    );
+}
+
+#[test]
+fn expanding_a_card_with_an_image_keeps_the_preview_attached() {
+    // The expand toggle rebuilds a card. If the rebuild reserved no image rows,
+    // the placements and the layout would disagree and the preview would paint
+    // over unrelated lines.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("shot.png");
+    let image = image::RgbImage::from_fn(32, 24, |x, y| {
+        image::Rgb([(x * 8) as u8, (y * 9) as u8, 30])
+    });
+
+    image.save(&path).expect("write fixture");
+
+    let bytes = std::fs::metadata(&path).expect("metadata").len();
+    let body = (1..=40)
+        .map(|line| format!("output line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut app = state();
+
+    app.apply_event(AgentEvent::ToolCallStarted {
+        call_id: "call-1".to_owned(),
+        tool: "read_file".to_owned(),
+        arguments: json!({ "path": "shot.png" }),
+    });
+    app.apply_event(AgentEvent::ToolResult {
+        call_id: "call-1".to_owned(),
+        tool: "read_file".to_owned(),
+        status: ToolStatus::Ok,
+        content: format!("shot.png · image/png · 32x24\n{body}"),
+        truncated: false,
+        process_id: None,
+        images: vec![t8ful_core::content::ImageInput::new(
+            "image/png",
+            path,
+            32,
+            24,
+            bytes,
+        )],
+    });
+
+    let mut layout = TranscriptLayout::default();
+
+    // Tall enough that the expanded body, its caption, and the preview all fit;
+    // the point is the rebuild, not the scroll window.
+    draw_with_layout(&mut app, &mut layout, 90, 120);
+
+    for _ in 0..200 {
+        if layout.apply_image_results() {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    app.expanded = true;
+
+    let expanded = draw_with_layout(&mut app, &mut layout, 90, 120);
+
+    assert!(
+        expanded.contains("image/png · 32x24"),
+        "the caption survives the rebuild: {expanded}"
+    );
+    assert!(
+        expanded.chars().any(|c| matches!(c, '▀' | '▄' | '█')),
+        "the preview is still painted after the rebuild: {expanded}"
+    );
+    assert!(!expanded.contains("decoding preview"), "{expanded}");
+}
+
+#[test]
+fn an_image_preview_fills_its_reserved_block_without_blank_edges() {
+    // The screenshot that exposed the bug: a 573x152 image in a wide terminal.
+    // The old sizing reserved the whole 100x24 cell box while the renderer
+    // painted only 58x8 inside it, leaving a 42-column blank strip on the right
+    // and 6 empty rows underneath.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("shot.png");
+    let image = image::RgbImage::from_fn(573, 152, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+    });
+
+    image.save(&path).expect("write fixture");
+
+    let bytes = std::fs::metadata(&path).expect("metadata").len();
+    let mut app = state();
+
+    app.entries
+        .push(Entry::Images(vec![t8ful_core::content::ImageInput::new(
+            "image/png",
+            path,
+            573,
+            152,
+            bytes,
+        )]));
+
+    let mut layout = TranscriptLayout::default();
+
+    // Wide enough that the reservation is not clamped to the terminal.
+    draw_with_layout(&mut app, &mut layout, 200, 40);
+
+    for _ in 0..200 {
+        if layout.apply_image_results() {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let buffer = draw_buffer_with_layout(&mut app, &mut layout, 200, 40);
+    let mut painted_rows = 0;
+    let mut first_painted_row = None;
+    let mut last_painted_column = 0;
+
+    for y in 0..buffer.area.height {
+        let mut row_painted = false;
+
+        for x in 0..buffer.area.width {
+            let cell = buffer.cell((x, y)).expect("cell");
+
+            if matches!(cell.symbol(), "▀" | "▄" | "█") {
+                row_painted = true;
+                last_painted_column = last_painted_column.max(x + 1);
+            }
+        }
+
+        if row_painted {
+            painted_rows += 1;
+            first_painted_row.get_or_insert(y);
+        }
+    }
+
+    assert!(painted_rows > 0, "the preview was never painted");
+
+    // The transcript is one caption line plus the preview block. If the block
+    // reserved more rows than the renderer painted, the difference is ghost
+    // space under the image — exactly the bug this guards.
+    let (columns, rows) = t8ful_tui::images::fit_preview(
+        573,
+        152,
+        (10, 20),
+        t8ful_tui::images::MAX_PREVIEW_COLUMNS,
+        t8ful_tui::images::MAX_PREVIEW_ROWS,
+    );
+
+    assert_eq!(
+        painted_rows,
+        usize::from(rows),
+        "the preview painted {painted_rows} of the {rows} rows it reserved"
+    );
+    assert_eq!(
+        layout.total_lines(),
+        1 + usize::from(rows),
+        "the entry reserved ghost rows under the image"
+    );
+    assert_eq!(
+        last_painted_column,
+        columns + u16::from(first_painted_row.is_some()),
+        "the preview did not fill the {columns} columns it reserved"
+    );
+}
+
+#[test]
 fn an_image_caption_stays_readable_on_a_narrow_terminal() {
     let mut app = state();
 
@@ -1792,4 +2039,126 @@ fn an_image_caption_stays_readable_on_a_narrow_terminal() {
         "{screen}"
     );
     assert!(screen.contains("640x480"), "{screen}");
+}
+
+#[test]
+fn the_picker_shows_each_rows_provider_in_brackets() {
+    let mut app = state();
+
+    app.models = vec![
+        t8ful_tui::bridge::ModelRow::new("vendor/sol", Some("openrouter".to_owned())),
+        t8ful_tui::bridge::ModelRow::new("kimi-k3", Some("opencode-go".to_owned())),
+    ];
+    app.picker = Some(0);
+
+    let screen = draw(&mut app, 100, 30);
+
+    assert!(screen.contains("vendor/sol [openrouter]"), "{screen}");
+    assert!(screen.contains("kimi-k3 [opencode-go]"), "{screen}");
+}
+
+/// A journal-restored notice, as the resume path sees it.
+fn resumed_notice() -> t8ful_core::event::HistoryEntry {
+    t8ful_core::event::HistoryEntry {
+        role: t8ful_core::event::HistoryRole::Info,
+        text: t8ful_core::notice::ProcessNotice {
+            process_id: "process-1".to_owned(),
+            command: "cd /work && cargo fmt --all 2>&1 | tail -5".to_owned(),
+            state: "exited".to_owned(),
+            exit_code: Some(0),
+            signal: None,
+            elapsed_ms: 30_500,
+            total_bytes: 431,
+            truncated: false,
+            output_tail: "done".to_owned(),
+        }
+        .render(),
+        images: Vec::new(),
+        tool: None,
+        arguments: None,
+        status: None,
+        truncated: false,
+    }
+}
+
+#[test]
+fn a_resumed_notice_draws_a_card_not_an_envelope() {
+    let mut app = state();
+
+    app.apply_event(AgentEvent::HistoryRestored {
+        entries: vec![resumed_notice()],
+    });
+
+    let screen = draw(&mut app, 120, 30);
+
+    assert!(screen.contains("process-1"), "{screen}");
+    assert!(screen.contains("cargo fmt --all"), "{screen}");
+    assert!(!screen.contains("<process_notice"), "{screen}");
+    assert!(!screen.contains("</process_notice>"), "{screen}");
+    assert!(!screen.contains("&amp;"), "{screen}");
+    assert!(!screen.contains("&gt;"), "{screen}");
+}
+
+#[test]
+fn cards_are_separated_by_exactly_one_row_after_a_resume() {
+    let mut app = state();
+
+    app.apply_event(AgentEvent::HistoryRestored {
+        entries: vec![
+            t8ful_core::event::HistoryEntry {
+                role: t8ful_core::event::HistoryRole::Tool,
+                text: "before\n".to_owned(),
+                images: Vec::new(),
+                tool: Some("bash".to_owned()),
+                arguments: Some(json!({ "command": "true" })),
+                status: Some(ToolStatus::Ok),
+                truncated: false,
+            },
+            resumed_notice(),
+            t8ful_core::event::HistoryEntry {
+                role: t8ful_core::event::HistoryRole::Tool,
+                text: "after\n".to_owned(),
+                images: Vec::new(),
+                tool: Some("bash".to_owned()),
+                arguments: Some(json!({ "command": "true" })),
+                status: Some(ToolStatus::Ok),
+                truncated: false,
+            },
+        ],
+    });
+
+    let buffer = draw_buffer(&mut app, 120, 30);
+    let rows = (0..buffer.area.height)
+        .map(|y| row_text(&buffer, y))
+        .collect::<Vec<_>>();
+    let first = rows
+        .iter()
+        .position(|row| row.contains("before"))
+        .expect("the first card");
+    let notice = rows
+        .iter()
+        .position(|row| row.contains("process-1"))
+        .expect("the notice card");
+    let second = rows
+        .iter()
+        .position(|row| row.contains("after"))
+        .expect("the second card");
+
+    // Each card body ends in a newline, which used to paint a blank banded row
+    // under it; only the separators between cards may be blank.
+    let between = &rows[first + 1..notice];
+
+    assert_eq!(
+        between.iter().filter(|row| row.trim().is_empty()).count(),
+        1,
+        "{rows:#?}"
+    );
+    assert_eq!(
+        rows[notice + 1..second]
+            .iter()
+            .filter(|row| row.trim().is_empty())
+            .count(),
+        1,
+        "{rows:#?}"
+    );
 }

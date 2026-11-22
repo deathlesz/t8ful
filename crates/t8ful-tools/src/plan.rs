@@ -64,6 +64,7 @@ not approve the plan; the user's next message is the instruction."
                 .to_owned(),
             truncated: false,
             metadata: Some(json!({ "present_plan": true })),
+            images: Vec::new(),
         })
     }
 }

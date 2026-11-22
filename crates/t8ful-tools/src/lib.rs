@@ -4,6 +4,7 @@
 //! `t8ful-core` before a tool is dispatched.
 
 pub mod agent_tools;
+pub mod attachments;
 pub mod edit;
 pub mod env;
 pub mod patch;
@@ -28,6 +29,9 @@ use t8ful_core::tool::ToolRegistry;
 
 use crate::process::ProcessManager;
 
+pub use attachments::{
+    AttachmentStore, NoAttachments, SniffedImage, caption, encoded_size, image_magic, sniff_image,
+};
 pub use edit::EditFileTool;
 pub use patch::ApplyPatchTool;
 pub use plan::PresentPlanTool;
@@ -45,15 +49,16 @@ pub use shell::BashTool;
 pub use skill::{NoSkills, SkillDocument, SkillLibrary, SkillSummary, SkillTool};
 pub use write::WriteFileTool;
 
-/// Create the built-in tool set backed by one process manager and the
-/// discovered skill library.
+/// Create the built-in tool set backed by one process manager, the discovered
+/// skill library, and session-owned image storage.
 pub fn builtin_registry(
     processes: Arc<ProcessManager>,
     skills: Arc<dyn SkillLibrary>,
+    attachments: Arc<dyn AttachmentStore>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
-    registry.register(ReadFileTool);
+    registry.register(ReadFileTool::new(attachments));
     registry.register(WriteFileTool);
     registry.register(EditFileTool);
     registry.register(ApplyPatchTool);
@@ -98,7 +103,11 @@ mod tests {
     #[test]
     fn registry_exposes_every_builtin_tool_once() {
         let processes = std::sync::Arc::new(super::ProcessManager::new(1024));
-        let registry = builtin_registry(processes, std::sync::Arc::new(super::NoSkills));
+        let registry = builtin_registry(
+            processes,
+            std::sync::Arc::new(super::NoSkills),
+            std::sync::Arc::new(super::NoAttachments),
+        );
 
         assert_eq!(registry.len(), BUILTIN_TOOL_NAMES.len());
 
@@ -110,7 +119,11 @@ mod tests {
     #[test]
     fn read_side_tools_are_read_only() {
         let processes = std::sync::Arc::new(super::ProcessManager::new(1024));
-        let registry = builtin_registry(processes, std::sync::Arc::new(super::NoSkills));
+        let registry = builtin_registry(
+            processes,
+            std::sync::Arc::new(super::NoSkills),
+            std::sync::Arc::new(super::NoAttachments),
+        );
         let context = ToolContext::new(PathBuf::from("/tmp"), PathBuf::from("/tmp"));
 
         let _ = context;

@@ -446,6 +446,7 @@ fn sandbox_env(env: &BTreeMap<String, String>) -> Vec<(String, String)> {
         "DISPLAY",
         "NIX_REMOTE",
         "OPENROUTER_API_KEY",
+        "OPENCODE_GO_API_KEY",
     ];
 
     let mut values = env
@@ -740,6 +741,7 @@ mod tests {
         env.insert("XDG_CONFIG_HOME".to_owned(), "/home/u/.config".to_owned());
         env.insert("SSH_AUTH_SOCK".to_owned(), "/run/ssh".to_owned());
         env.insert("OPENROUTER_API_KEY".to_owned(), "sk-or-secret".to_owned());
+        env.insert("OPENCODE_GO_API_KEY".to_owned(), "oc_sk-secret".to_owned());
 
         let values = sandbox_env(&env);
         let get = |name: &str| {
@@ -755,6 +757,7 @@ mod tests {
         assert_eq!(get("TERM"), Some("dumb"));
         assert_eq!(get("SSH_AUTH_SOCK"), None);
         assert_eq!(get("OPENROUTER_API_KEY"), None);
+        assert_eq!(get("OPENCODE_GO_API_KEY"), None);
     }
 
     #[test]

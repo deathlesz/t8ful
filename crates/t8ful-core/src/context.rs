@@ -262,6 +262,17 @@ pub fn estimate_message(message: &Message) -> u64 {
             }
             crate::Content::ToolResult(result) => {
                 tokens += estimate_tokens(&result.content);
+
+                // The transport hoists a result's images into a user message, so
+                // they cost budget exactly as an inline image does; a screenshot
+                // read would otherwise slip past the window estimate.
+                if !result.images.is_empty() {
+                    has_image = true;
+
+                    for image in &result.images {
+                        tokens += estimate_image_tokens(image.width, image.height);
+                    }
+                }
             }
         }
     }
@@ -573,5 +584,68 @@ mod tests {
 
         assert!(estimate_tools(&[spec]) > 0);
         assert!(estimate_message(&assistant("hello")) > 0);
+    }
+
+    #[test]
+    fn a_tool_result_images_are_charged_like_an_inline_image() {
+        // The transport hoists a result's images into a user message, so the
+        // window estimate has to see them: a screenshot read would otherwise
+        // look free and blow the budget on the next request.
+        let call = ToolCall::new("call-1", "read_file", json!({ "path": "shot.png" }));
+        let image = crate::content::ImageInput::new(
+            "image/png",
+            std::path::PathBuf::from("/state/attachments/shot.png"),
+            1200,
+            800,
+            34_816,
+        );
+        let text_only = crate::tool::ToolResult::new(&call, ToolStatus::Ok, "shot.png", false);
+        let with_image = text_only.clone().with_images(vec![image.clone()]);
+        let without = estimate_message(&Message::tool_results([text_only]));
+        let costing = estimate_message(&Message::tool_results([with_image]));
+
+        assert!(
+            costing > without,
+            "an image result must cost more: {without} vs {costing}"
+        );
+        // Charged exactly as the same image in a user message, so neither path
+        // is cheaper and no request silently overruns.
+        assert_eq!(
+            costing - without,
+            estimate_message(&Message::user_with_images(None, vec![image]))
+                - estimate_message(&Message::user_with_images(None, Vec::new()))
+        );
+    }
+
+    #[test]
+    fn a_tool_result_round_trips_with_and_without_images() {
+        // Journals written before this field existed carry no `images` key, so
+        // the default has to keep them loading.
+        let call = ToolCall::new("call-1", "read_file", json!({}));
+        let plain = crate::tool::ToolResult::new(&call, ToolStatus::Ok, "a.txt", false);
+        let encoded = serde_json::to_string(&plain).unwrap();
+        let decoded: crate::tool::ToolResult = serde_json::from_str(&encoded).unwrap();
+
+        assert!(decoded.images.is_empty(), "{encoded}");
+
+        let mut legacy = serde_json::to_value(&plain).unwrap();
+
+        legacy.as_object_mut().unwrap().remove("images");
+
+        let decoded: crate::tool::ToolResult = serde_json::from_value(legacy).unwrap();
+
+        assert!(decoded.images.is_empty());
+
+        let with_image = plain.with_images(vec![crate::content::ImageInput::new(
+            "image/png",
+            std::path::PathBuf::from("/state/shot.png"),
+            40,
+            30,
+            128,
+        )]);
+        let encoded = serde_json::to_string(&with_image).unwrap();
+        let decoded: crate::tool::ToolResult = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded, with_image, "{encoded}");
     }
 }

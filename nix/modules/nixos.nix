@@ -3,7 +3,8 @@
 # Writes the system layer: `/etc/xdg/t8ful/config.toml` plus one link per pinned
 # skill under `/etc/xdg/t8ful/skills`. t8ful reads the system layer when
 # `XDG_CONFIG_DIRS` is unset or includes `/etc/xdg`. Credentials are never
-# written; t8ful reads `OPENROUTER_API_KEY` from the environment.
+# written; t8ful reads `OPENROUTER_API_KEY` and `OPENCODE_GO_API_KEY` from
+# the environment.
 {self}: {
   config,
   lib,

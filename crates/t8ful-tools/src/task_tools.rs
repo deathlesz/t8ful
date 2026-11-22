@@ -220,6 +220,7 @@ impl Tool for TaskCreateTool {
             content: format!("{id} created\n{}", self.tasks.rows_text()),
             truncated: false,
             metadata: Some(json!({ "id": id.as_str() })),
+            images: Vec::new(),
         })
     }
 }
@@ -340,6 +341,7 @@ impl Tool for TaskUpdateTool {
             content: format!("{id} updated\n{}", self.tasks.rows_text()),
             truncated: false,
             metadata: Some(json!({ "id": id.as_str() })),
+            images: Vec::new(),
         })
     }
 }
@@ -418,6 +420,7 @@ impl Tool for TaskListTool {
                 "tasks": graph.len(),
                 "completed": graph.completed(),
             })),
+            images: Vec::new(),
         })
     }
 }

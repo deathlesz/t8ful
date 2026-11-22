@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/deathlesz/t8ful"
@@ -14,6 +14,8 @@ rust-version = "1.88"
 [workspace.dependencies]
 t8ful-core = { path = "crates/t8ful-core" }
 t8ful-openrouter = { path = "crates/t8ful-openrouter" }
+t8ful-openai = { path = "crates/t8ful-openai" }
+t8ful-opencode = { path = "crates/t8ful-opencode" }
 t8ful-tools = { path = "crates/t8ful-tools" }
 t8ful-tui = { path = "crates/t8ful-tui" }
 t8ful-sandbox = { path = "crates/t8ful-sandbox" }

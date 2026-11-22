@@ -99,6 +99,8 @@ pub struct LoadedSession {
     pub model: Option<String>,
     pub mode: Mode,
     pub reasoning_effort: ReasoningEffort,
+    /// The provider the selected model belongs to, when the journal recorded it.
+    pub provider: Option<String>,
     pub queued: Vec<QueuedInput>,
     pub queue_paused: bool,
     pub attachments: Vec<ImageInput>,
@@ -129,6 +131,11 @@ pub enum JournalRecord {
         mode: Mode,
         #[serde(default)]
         reasoning_effort: ReasoningEffort,
+        /// The provider the model belongs to, so a resume re-selects the same
+        /// copy when both catalogs offer the id. Journals written before the
+        /// field existed read as `None` and fall back to the catalog index.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     QueueAdded {
         id: String,
@@ -250,6 +257,7 @@ struct JournalParams {
     model: Option<String>,
     mode: Mode,
     reasoning_effort: ReasoningEffort,
+    provider: Option<String>,
     ledger: Option<Arc<UsageLedger>>,
 }
 
@@ -293,6 +301,7 @@ impl SessionJournal {
             model,
             mode,
             reasoning_effort,
+            None,
             Some(ledger),
         )?;
 
@@ -311,6 +320,7 @@ impl SessionJournal {
         model: Option<String>,
         mode: Mode,
         reasoning_effort: ReasoningEffort,
+        provider: Option<String>,
         ledger: Option<Arc<UsageLedger>>,
     ) -> Result<Self, SessionError> {
         let canonical_root = std::fs::canonicalize(project_root)?;
@@ -323,6 +333,7 @@ impl SessionJournal {
                 model,
                 mode,
                 reasoning_effort,
+                provider,
                 ledger,
             }),
             open: Arc::new(Mutex::new(None)),
@@ -363,6 +374,7 @@ impl SessionJournal {
                 model: loaded.model.clone(),
                 mode: loaded.mode,
                 reasoning_effort: loaded.reasoning_effort,
+                provider: loaded.provider.clone(),
                 ledger: Some(ledger),
             }),
             open: Arc::new(Mutex::new(Some(OpenJournal {
@@ -463,6 +475,27 @@ impl SessionJournal {
             model,
             mode,
             reasoning_effort,
+            provider: None,
+        })
+        .await
+    }
+
+    /// Record a model change together with the provider that serves it.
+    ///
+    /// The provider is written only when it is known; a journal without it
+    /// falls back to the catalog index on resume.
+    pub async fn record_settings_with_provider(
+        &self,
+        model: Option<String>,
+        mode: Mode,
+        reasoning_effort: ReasoningEffort,
+        provider: Option<String>,
+    ) -> Result<(), SessionError> {
+        self.append(JournalRecord::Settings {
+            model,
+            mode,
+            reasoning_effort,
+            provider,
         })
         .await
     }
@@ -618,6 +651,7 @@ fn header_lines(params: &JournalParams) -> Vec<Vec<u8>> {
             model: params.model.clone(),
             mode: params.mode,
             reasoning_effort: params.reasoning_effort,
+            provider: params.provider.clone(),
         },
     ];
 
@@ -778,6 +812,7 @@ fn load_from_bytes(
     let mut model: Option<String> = None;
     let mut mode = Mode::Coding;
     let mut reasoning_effort = ReasoningEffort::Default;
+    let mut provider: Option<String> = None;
     let mut queue: VecDeque<QueuedInput> = VecDeque::new();
     let mut queue_paused = false;
     let mut attachments: Vec<ImageInput> = Vec::new();
@@ -837,7 +872,12 @@ fn load_from_bytes(
                 model: selected,
                 mode: selected_mode,
                 reasoning_effort: selected_effort,
+                provider: selected_provider,
             } => {
+                if selected_provider.is_some() {
+                    provider = selected_provider;
+                }
+
                 if selected.is_some() {
                     model = selected;
                 }
@@ -993,6 +1033,7 @@ fn load_from_bytes(
         model,
         mode,
         reasoning_effort,
+        provider,
         queued: queue.into_iter().collect(),
         queue_paused,
         attachments,
@@ -1433,6 +1474,7 @@ mod tests {
             Some("vendor/model".to_owned()),
             Mode::Coding,
             ReasoningEffort::Default,
+            None,
             Some(Arc::clone(&ledger)),
         )
         .unwrap();
@@ -1548,6 +1590,66 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded.reasoning_effort, ReasoningEffort::Low);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_provider_survives_a_resume() {
+        let (_dir, project, state, ledger) = fixture();
+        let journal = SessionJournal::create(
+            &state,
+            &project,
+            Some("deepseek-v4.1-flash".to_owned()),
+            Mode::Coding,
+            ReasoningEffort::Default,
+            Arc::clone(&ledger),
+        )
+        .await
+        .unwrap();
+        let id = journal.id().clone();
+
+        journal
+            .record_settings_with_provider(
+                Some("deepseek-v4.1-flash".to_owned()),
+                Mode::Coding,
+                ReasoningEffort::Default,
+                Some("opencode-go".to_owned()),
+            )
+            .await
+            .unwrap();
+        drop(journal);
+
+        let (_, loaded) = SessionJournal::open(&state, &id, &project, Arc::clone(&ledger))
+            .await
+            .unwrap();
+
+        // A duplicated id must re-select the same provider after a resume.
+        assert_eq!(loaded.provider.as_deref(), Some("opencode-go"));
+    }
+
+    #[tokio::test]
+    async fn a_journal_without_a_provider_reads_none() {
+        let (_dir, project, state, ledger) = fixture();
+        let journal = SessionJournal::create(
+            &state,
+            &project,
+            Some("vendor/model".to_owned()),
+            Mode::Coding,
+            ReasoningEffort::Default,
+            Arc::clone(&ledger),
+        )
+        .await
+        .unwrap();
+        let id = journal.id().clone();
+
+        journal.record_user_message("hello").await.unwrap();
+        drop(journal);
+
+        let (_, loaded) = SessionJournal::open(&state, &id, &project, Arc::clone(&ledger))
+            .await
+            .unwrap();
+
+        // Older journals carry no provider and fall back to the catalog index.
+        assert_eq!(loaded.provider, None);
     }
 
     #[tokio::test]

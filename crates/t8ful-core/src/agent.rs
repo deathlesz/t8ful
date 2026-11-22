@@ -44,6 +44,11 @@ pub struct AgentConfig {
     pub agent_id: String,
     /// Unique per run; keeps request IDs distinct across resumed sessions.
     pub request_namespace: String,
+    /// The conversation this agent is recording into.
+    ///
+    /// Providers that need a stable per-conversation identifier on the wire use
+    /// this; an empty string means the session has not been allocated yet.
+    pub session_id: String,
 }
 
 impl AgentConfig {
@@ -60,6 +65,7 @@ impl AgentConfig {
             supports_reasoning: None,
             agent_id: "root".to_owned(),
             request_namespace: "run".to_owned(),
+            session_id: String::new(),
         }
     }
 }
@@ -285,6 +291,14 @@ impl Agent {
 
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    /// Point the agent at a different conversation.
+    ///
+    /// Providers that require a per-conversation identifier on the wire read it
+    /// from every request, so a session switch must update it here.
+    pub fn set_session_id(&mut self, session_id: impl Into<String>) {
+        self.config.session_id = session_id.into();
     }
 
     pub fn supports_reasoning(&self) -> Option<bool> {
@@ -607,6 +621,7 @@ impl Agent {
                 max_output_tokens: self.config.max_output_tokens,
                 reasoning,
                 reasoning_value: self.reasoning_profile.provider_value(reasoning),
+                session_id: Some(self.config.session_id.clone()).filter(|id| !id.is_empty()),
             };
 
             // The system prompt is sent separately by the provider. Remove the
@@ -666,6 +681,9 @@ impl Agent {
                     }
                     Ok(ProviderEvent::ReasoningDelta(delta)) => {
                         events.send(AgentEvent::ReasoningDelta { text: delta });
+                    }
+                    Ok(ProviderEvent::Warning(message)) => {
+                        events.send(AgentEvent::Warning { message });
                     }
                     Ok(ProviderEvent::TextDelta(delta)) => {
                         events.send(AgentEvent::TextDelta {
@@ -942,6 +960,7 @@ impl Agent {
                             .map(str::to_owned);
 
                         ToolResult::new(call, ToolStatus::Ok, output.content, output.truncated)
+                            .with_images(output.images)
                     }
                     Some(Err(ToolError::InputRequired(message))) => {
                         input_required = true;
@@ -1581,7 +1600,7 @@ impl Agent {
         messages: &[Message],
         events: &EventEmitter,
     ) -> Result<(), AgentError> {
-        if !messages.iter().any(Message::has_images) {
+        if !messages.iter().any(Message::carries_images) {
             return Ok(());
         }
 
@@ -1681,6 +1700,7 @@ fn tool_result_event(result: &ToolResult, process_id: Option<String>) -> AgentEv
         content: result.content.clone(),
         truncated: result.truncated,
         process_id,
+        images: result.images.clone(),
     }
 }
 

@@ -235,7 +235,7 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use tempfile::TempDir;
@@ -443,23 +443,35 @@ mod tests {
     #[test]
     fn a_broken_git_is_reported_instead_of_being_treated_as_no_repository() {
         let dir = TempDir::new().unwrap();
-        let fake_git = dir.path().join("git");
-
-        std::fs::write(
-            &fake_git,
+        let fake_git = write_script(
+            dir.path(),
             "#!/bin/sh\necho 'fatal: detected dubious ownership' >&2\nexit 128\n",
-        )
-        .unwrap();
+        );
+
+        let error = discover_with(dir.path(), Some(&fake_git)).expect_err("hard failure");
+
+        assert!(error.to_string().contains("dubious ownership"), "{error}");
+    }
+
+    /// Write an executable script and return its path.
+    ///
+    /// The write handle is closed before the permission change and before any
+    /// exec: a child forked while this process still holds the file open
+    /// inherits the handle, and `execve` then fails with `ETXTBSY` on a busy
+    /// text file. That race is invisible on a fast local disk and reproducible
+    /// in a build sandbox.
+    fn write_script(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("git");
+
+        std::fs::write(&path, body).unwrap();
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let error = discover_with(dir.path(), Some(&fake_git)).expect_err("hard failure");
-
-        assert!(error.to_string().contains("dubious ownership"), "{error}");
+        path
     }
 }

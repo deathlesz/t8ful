@@ -1,15 +1,13 @@
-mod support;
-
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use support::{FakeServer, Reply, chunked, sse_frame};
 use t8ful_core::error::ProviderError;
 use t8ful_core::message::Conversation;
 use t8ful_core::provider::{
     FinishReason, Provider, ProviderEvent, ProviderRequest, ReasoningEffort,
 };
+use t8ful_openai::test_support::{FakeServer, Reply, chunked, sse_frame};
 use t8ful_openrouter::OpenRouterClient;
 
 fn request(prompt: &str) -> ProviderRequest {
@@ -25,6 +23,7 @@ fn request(prompt: &str) -> ProviderRequest {
         max_output_tokens: None,
         reasoning: ReasoningEffort::Default,
         reasoning_value: None,
+        session_id: Some("ses_test".to_owned()),
     }
 }
 
@@ -495,11 +494,7 @@ async fn authentication_failure_is_actionable() {
 
 #[tokio::test]
 async fn rate_limit_reports_retry_after() {
-    let mut reply = Reply::status(429, "{\"error\":\"slow down\"}");
-
-    reply.content_type = "application/json".to_owned();
-
-    let server = FakeServer::start(vec![reply]).await;
+    let server = FakeServer::start(vec![Reply::status(429, "{\"error\":\"slow down\"}")]).await;
     let client = OpenRouterClient::with_base_url(server.base_url(), "key").expect("client");
     let events = collect(&client, request("hi")).await;
 
@@ -508,8 +503,177 @@ async fn rate_limit_reports_retry_after() {
         _ => None,
     });
 
-    // The fake server sends no Retry-After header, so the value stays unknown.
+    // The fake server sends no Retry-After header, so nothing says when to
+    // come back and the request is not re-sent.
     assert_eq!(retry_after, Some(None));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_rate_limited_request_is_retried_after_its_retry_after() {
+    let server = FakeServer::start(vec![
+        Reply::status(429, "{\"error\":\"slow down\"}").with_header("retry-after", "0"),
+        Reply::sse(vec![
+            text_chunk("Hello"),
+            finish_chunk("stop"),
+            done_chunk(),
+        ]),
+    ])
+    .await;
+    let client = OpenRouterClient::with_base_url(server.base_url(), "key").expect("client");
+    let events = collect(&client, request("hi")).await;
+
+    let warnings = events
+        .iter()
+        .filter(|event| matches!(event, Ok(ProviderEvent::Warning(_))))
+        .count();
+
+    assert_eq!(warnings, 1, "one warning per retry: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Ok(ProviderEvent::TextDelta(text)) if text == "Hello")),
+        "the retry must deliver the response: {events:?}"
+    );
+
+    let recorded = server.requests();
+
+    assert_eq!(recorded.len(), 2, "one rejection and one retry");
+    assert_eq!(
+        recorded[0].body, recorded[1].body,
+        "the retry resends the same body"
+    );
+    assert_eq!(recorded[1].body["stream"], json!(true));
+}
+
+#[tokio::test]
+async fn an_over_cap_retry_after_is_reported_instead_of_waited_out() {
+    let server = FakeServer::start(vec![
+        Reply::status(429, "{\"error\":\"slow down\"}").with_header("retry-after", "300"),
+    ])
+    .await;
+    let client = OpenRouterClient::with_base_url(server.base_url(), "key").expect("client");
+    let events = collect(&client, request("hi")).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Err(ProviderError::RateLimited { .. }))),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Ok(ProviderEvent::Warning(_)))),
+        "an unaffordable wait must not announce a retry: {events:?}"
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_mid_stream_rate_limit_is_never_retried() {
+    // The deltas already reached the consumer, so re-sending the request would
+    // duplicate them. The frame lands after a text delta for exactly that case.
+    let frame = json!({
+        "error": { "code": 429, "message": "slow down" },
+        "choices": []
+    });
+    let server = FakeServer::start(vec![Reply::sse(vec![
+        text_chunk("He"),
+        sse_frame(&frame.to_string()).into_bytes(),
+    ])])
+    .await;
+    let client = OpenRouterClient::with_base_url(server.base_url(), "key").expect("client");
+    let events = collect(&client, request("hi")).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Err(ProviderError::RateLimited { .. }))),
+        "{events:?}"
+    );
+    assert_eq!(server.requests().len(), 1, "a stream error is not a retry");
+}
+
+#[tokio::test]
+async fn an_in_flight_budget_refusal_is_retried_but_exhausted_credits_are_not() {
+    let refusal = |source: &str| {
+        Reply::status(
+            402,
+            json!({ "error": { "message": "payment required", "metadata": { "limit_source": source } } })
+                .to_string(),
+        )
+        .with_header("retry-after", "0")
+    };
+
+    // A concurrency budget frees up on its own, so waiting can succeed.
+    let server = FakeServer::start(vec![
+        refusal("openrouter_in_flight_budget"),
+        Reply::sse(vec![
+            text_chunk("Hello"),
+            finish_chunk("stop"),
+            done_chunk(),
+        ]),
+    ])
+    .await;
+    let client = OpenRouterClient::with_base_url(server.base_url(), "key").expect("client");
+    let events = collect(&client, request("hi")).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Ok(ProviderEvent::TextDelta(text)) if text == "Hello")),
+        "{events:?}"
+    );
+    assert_eq!(server.requests().len(), 2);
+
+    // An exhausted balance never clears by waiting, so it is reported at once
+    // with the fix the user has to make.
+    let server = FakeServer::start(vec![refusal("openrouter_credits")]).await;
+    let client = OpenRouterClient::with_base_url(server.base_url(), "key").expect("client");
+    let events = collect(&client, request("hi")).await;
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            Err(error @ ProviderError::PaymentRequired { .. }) => Some(error.to_string()),
+            _ => None,
+        })
+        .expect("a payment refusal");
+
+    assert!(message.contains("add credits"), "{message}");
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn dropping_the_stream_during_a_retry_wait_stops_the_pump() {
+    let server = FakeServer::start(vec![
+        Reply::status(429, "{\"error\":\"slow down\"}").with_header("retry-after", "120"),
+        Reply::sse(vec![text_chunk("late"), finish_chunk("stop"), done_chunk()]),
+    ])
+    .await;
+    let client = OpenRouterClient::with_base_url(server.base_url(), "key").expect("client");
+    let mut stream = client.stream(request("hi"));
+
+    // The first item is the retry notice; the pump is then sleeping out the
+    // 120-second wait that the consumer no longer wants.
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the retry notice arrives without waiting")
+        .expect("an event");
+
+    assert!(
+        matches!(&first, Ok(ProviderEvent::Warning(message)) if message.contains("retry 2/5")),
+        "{first:?}"
+    );
+
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "an abandoned turn must not re-send the request"
+    );
 }
 
 #[tokio::test]
@@ -1039,4 +1203,44 @@ async fn a_stalled_stream_fails_with_a_transport_error() {
         matches!(events.last(), Some(Err(ProviderError::Transport(message))) if message.contains("sent nothing")),
         "{events:?}"
     );
+}
+
+/// OpenRouter attributes traffic by these headers. Losing them silently removes
+/// t8ful from the rankings it is meant to appear in, so both requests assert
+/// them explicitly.
+#[tokio::test]
+async fn every_request_carries_the_openrouter_attribution_headers() {
+    let models = json!({ "data": [{ "id": "vendor/model" }] }).to_string();
+    let server = FakeServer::start(vec![
+        Reply::json(models),
+        Reply::sse(vec![finish_chunk("stop"), done_chunk()]),
+    ])
+    .await;
+
+    let client = OpenRouterClient::with_base_url(server.base_url(), "key").expect("client");
+
+    client.list_models().await.expect("catalog");
+    let _ = collect(&client, request("hi")).await;
+
+    let recorded = server.requests();
+
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+
+    for record in &recorded {
+        let user_agent = record.header("user-agent").unwrap_or_default();
+
+        assert!(
+            user_agent.starts_with("t8ful/"),
+            "{} sent user-agent {user_agent}",
+            record.path
+        );
+        assert_eq!(
+            record.header("http-referer"),
+            Some("https://github.com/deathlesz/t8ful"),
+            "{}",
+            record.path
+        );
+        assert_eq!(record.header("x-openrouter-title"), Some("t8ful"));
+        assert_eq!(record.header("x-openrouter-categories"), Some("cli-agent"));
+    }
 }

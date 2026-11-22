@@ -48,6 +48,7 @@ impl TuiFixture {
         let mut command = self.command();
 
         command.env_remove("OPENROUTER_API_KEY");
+        command.env_remove("OPENCODE_GO_API_KEY");
 
         command
     }
@@ -866,11 +867,10 @@ async fn a_prompt_submitted_before_mcp_settles_is_queued_then_runs_with_its_tool
     assert!(session.wait_for_ready(Duration::from_secs(20)));
     session.send(b"hello\r");
 
+    // The catalog may still be loading too, so either wording proves the hold;
+    // what matters is that the prompt waits for discovery instead of running.
     assert!(
-        session.wait_for(
-            "waiting for MCP servers before running this prompt",
-            Duration::from_secs(20)
-        ),
+        session.wait_for("before running this prompt", Duration::from_secs(20)),
         "the prompt was not held while MCP startup was pending: {:?}",
         session.screen
     );
@@ -3373,7 +3373,7 @@ async fn logout_without_an_environment_key_disconnects_the_session() {
     session.send(b"hello\r");
 
     assert!(
-        session.wait_for("missing OpenRouter credentials", Duration::from_secs(20)),
+        session.wait_for("missing provider credentials", Duration::from_secs(20)),
         "the disconnected session still tried to run a prompt: {:?}",
         session.screen
     );
@@ -3408,6 +3408,84 @@ async fn logout_with_an_environment_key_keeps_the_session_connected() {
         "{:?}",
         session.screen
     );
+
+    let (success, screen) = session.quit();
+
+    assert!(success, "{screen:?}");
+}
+
+/// `/login opencode-go` stores the Go key under its own name and leaves the
+/// OpenRouter credential alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_opencode_go_reports_the_go_credential_source() {
+    let server = FakeServer::start(vec![Reply::body(text_stream("unused"))]).await;
+    let fixture = TuiFixture::new(&server);
+    let mut session = Session::start_command(fixture.command_without_key());
+
+    assert!(
+        session.wait_for("not connected; run /login", Duration::from_secs(20)),
+        "{:?}",
+        session.screen
+    );
+
+    session.send(b"/login opencode-go\r");
+
+    assert!(
+        session.wait_for("login opencode-go", Duration::from_secs(20)),
+        "{:?}",
+        session.screen
+    );
+    // The modal names the variable that overrides the stored key for the
+    // provider being logged into.
+    assert!(
+        session.wait_for(
+            "OPENCODE_GO_API_KEY overrides a stored key while it is set",
+            Duration::from_secs(20)
+        ),
+        "{:?}",
+        session.screen
+    );
+
+    session.send(b"oc_sk-typed\r");
+
+    let stored = fixture.home.path().join("state/t8ful/auth.json");
+    let deadline = Instant::now() + Duration::from_secs(20);
+
+    while !stored.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "login never saved the Go key: {:?}",
+            session.screen
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let document = std::fs::read_to_string(&stored).expect("read the credentials file");
+
+    assert!(document.contains("opencode_go"), "{document}");
+    assert!(document.contains("oc_sk-typed"), "{document}");
+    assert!(!document.contains("openrouter"), "{document}");
+
+    // Logging out of one provider must not touch the other's stored key.
+    session.send(b"/logout opencode-go\r");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+
+    while Instant::now() < deadline {
+        let gone = std::fs::read_to_string(&stored)
+            .map(|contents| !contents.contains("oc_sk-typed"))
+            .unwrap_or(true);
+
+        if gone {
+            break;
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let document = std::fs::read_to_string(&stored).expect("read the credentials file");
+
+    assert!(!document.contains("oc_sk-typed"), "{document}");
 
     let (success, screen) = session.quit();
 

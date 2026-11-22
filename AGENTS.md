@@ -2,13 +2,13 @@
 
 ## Overview
 
-t8ful is a Linux-first Rust coding agent (version 1.0.0) with a full-screen TUI, a headless CLI, and OpenRouter as its only provider.
+t8ful is a Linux-first Rust coding agent (version 1.1.1) with a full-screen TUI, a headless CLI, and two providers (OpenRouter and OpenCode Go) behind one merged catalog.
 
 - [docs/design.md](docs/design.md) is the authoritative behavior specification.
 - [README.md](README.md) is the user-facing introduction.
 - [docs/nix-modules.md](docs/nix-modules.md) documents the NixOS and Home Manager modules.
 
-The 1.0.0 feature set is complete (coding and plan modes, skills, MCP clients, Nix modules, session recall, per-tool toggles, task graph, subagents, and worktrees). Ongoing hardening and performance work must preserve the contracts in `docs/design.md`. Start new implementation work only when the user explicitly asks for it.
+The 1.1.1 feature set is complete (coding and plan modes, skills, MCP clients, Nix modules, session recall, per-tool toggles, task graph, subagents, and worktrees). Ongoing hardening and performance work must preserve the contracts in `docs/design.md`. Start new implementation work only when the user explicitly asks for it.
 
 ## Working rules
 
@@ -25,8 +25,10 @@ Rust edition 2024, resolver 3.
 | Crate | Contents |
 | --- | --- |
 | `t8ful-core` | Conversation model, `Provider`/`Tool` traits, `Policy`, `AgentEvent`, agent loop, context budgeting, journal and usage records, question/sandbox interfaces, task graph (`task`), child-agent identity/limits/registry/notices (`subagent`), and worktree interface (`worktree`). |
-| `t8ful-openrouter` | HTTP client, SSE decoder, fragmented tool-call assembly, model catalog, error mapping. |
-| `t8ful-tools` | `read_file`, `write_file`, `edit_file`, `apply_patch`, `ask_user_question`, `present_plan`, `recall`, `bash`, managed-process tools, `spawn_agents`, `agent_wait`, `agent_status`, and `task_*` tools. |
+| `t8ful-openai` | OpenAI-compatible transport shared by both providers: SSE decoder, fragmented tool-call assembly, HTTP/TLS client, prompt serialization, usage and error mapping, `test_support` loopback server. |
+| `t8ful-openrouter` | OpenRouter catalog, attribution headers, and `reasoning` request shape. |
+| `t8ful-opencode` | OpenCode Go catalog, endpoints, `x-opencode-session` header, and `reasoning_effort` request shape. |
+| `t8ful-tools` | `read_file` (text and images), `write_file`, `edit_file`, `apply_patch`, `ask_user_question`, `present_plan`, `recall`, `bash`, managed-process tools, `spawn_agents`, `agent_wait`, `agent_status`, and `task_*` tools, plus the injected `AttachmentStore` image storage is written through. |
 | `t8ful-mcp` | MCP server lifecycle over `rmcp` (stdio and Streamable HTTP), tool discovery, `mcp__server__tool` naming, per-server plan-mode trust, credential-free `ServerConfig`, bounded result rendering. |
 | `t8ful-sandbox` | Bubblewrap planning sandbox: fd-pinned read-only mounts, private scratch, seccomp, descriptor closing. |
 | `t8ful-tui` | Dashboard, render cache, slash-command table, markdown, clipboard, terminal lifecycle. |
@@ -95,4 +97,4 @@ nix build 'path:.#t8ful' --no-link
 - **No replay on doubt.** Never automatically retry a possibly side-effecting tool after a failure, stream error, or resume. The journal records dispatch intents and results so indeterminate outcomes are reported, never replayed.
 - **Subagents.** Single-level, non-blocking, never merged. `spawn_agents` returns immediately; finished child reports land on the parent's notice queue (separate from steering, which waits for the current step's tool calls before the next model request). Reports are delivered once, at an idle-wake turn or immediately before the next prompt; `agent_wait` consumes notices for the reports it returns. Isolated workers' worktrees and branches are reported and preserved — never merged, applied, or committed. A child's tools are its role's list intersected with the parent's, minus `spawn_agents`, `agent_wait`, `agent_status`, `ask_user_question`, and `present_plan`; a role with `bash` is still not a read-only boundary.
 - **MCP credentials.** Config holds environment variable *names* only, never values. `t8ful-mcp` reads them at spawn time, `ServerConfig` holds no secrets (`Debug` prints names only), every configured name joins the shell deny list, and local plan-mode servers do not receive them. Reject any new `[mcp.servers.*]` field that could hold a secret value.
-- **API keys and secrets.** Keep credentials out of Nix-generated files, logs, and journals. `OPENROUTER_API_KEY` always wins; otherwise t8ful falls back to `$XDG_STATE_HOME/t8ful/auth.json` (owner-only, written atomically by `/login`). That file is the only non-env credential store, must never become a build input, and must never be printed, logged, or journaled. Stripping known credential vars from shell commands is accidental-leak reduction, not a security boundary.
+- **API keys and secrets.** Keep credentials out of Nix-generated files, logs, and journals. `OPENROUTER_API_KEY` and `OPENCODE_GO_API_KEY` each win over the matching entry in `$XDG_STATE_HOME/t8ful/auth.json` (owner-only, written atomically by `/login <provider>`). That file is the only non-env credential store, must never become a build input, and must never be printed, logged, or journaled. Stripping known credential vars (`OPENROUTER_API_KEY`, `OPENCODE_GO_API_KEY`) from shell commands is accidental-leak reduction, not a security boundary.

@@ -53,10 +53,14 @@ pub enum TuiCommand {
         provider: String,
         key: Secret,
     },
-    /// Remove the stored API key.
-    Logout,
+    /// Remove the stored API key for one provider.
+    Logout {
+        provider: String,
+    },
     Cancel,
-    SelectModel(String),
+    /// Apply a model from the merged catalog. The chosen provider travels with
+    /// the id because the same id can exist in both catalogs.
+    SelectModel(ModelRow),
     SetReasoningEffort(ReasoningEffort),
     SetMode(Mode),
     /// Attach an image from a path or clipboard bytes.
@@ -178,6 +182,41 @@ pub enum ReasoningSnapshot {
     },
 }
 
+/// One model in the merged catalog, with the provider that serves it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ModelRow {
+    pub id: String,
+    /// `openrouter` or `opencode-go`; `None` when the driver published no
+    /// provenance (a test, or a catalog from a single-provider build).
+    pub provider: Option<String>,
+}
+
+impl ModelRow {
+    pub fn new(id: impl Into<String>, provider: Option<String>) -> Self {
+        Self {
+            id: id.into(),
+            provider,
+        }
+    }
+
+    /// The row as the picker renders it: the id plus the source in brackets.
+    pub fn label(&self) -> String {
+        match &self.provider {
+            Some(provider) if !provider.is_empty() => format!("{} [{}]", self.id, provider),
+            _ => self.id.clone(),
+        }
+    }
+
+    /// What the fuzzy filter matches against, so `/model opencode` narrows to
+    /// the Go catalog.
+    pub fn filter_text(&self) -> String {
+        match &self.provider {
+            Some(provider) => format!("{} {}", self.id, provider),
+            None => self.id.clone(),
+        }
+    }
+}
+
 /// TUI-only model catalog state. This is deliberately separate from
 /// [`t8ful_core::event::AgentEvent`] so the headless event schema does not change.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -185,7 +224,7 @@ pub enum CatalogSnapshot {
     #[default]
     Pending,
     Loaded {
-        models: Vec<String>,
+        models: Vec<ModelRow>,
     },
     Failed {
         message: String,
@@ -260,17 +299,55 @@ pub struct ProjectFilesSnapshot {
     pub files: Vec<String>,
 }
 
-/// TUI-only credential state. Deliberately separate from
-/// [`t8ful_core::event::AgentEvent`] so the headless event schema does not change.
+/// Where one provider's active credential comes from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum AuthSnapshot {
+pub enum AuthKind {
     /// No key is configured; run `/login`.
     #[default]
     Missing,
-    /// `OPENROUTER_API_KEY` is set and overrides any stored key.
+    /// The provider's environment variable is set and overrides any stored key.
     Environment,
     /// The key in `auth.json` is active.
     Stored,
+}
+
+impl AuthKind {
+    /// The wording the login modal shows for this source.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::Stored => "stored in auth.json",
+            Self::Missing => "not connected",
+        }
+    }
+}
+
+/// TUI-only credential state, one entry per provider. Deliberately separate
+/// from [`t8ful_core::event::AgentEvent`] so the headless event schema does not
+/// change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuthSnapshot {
+    pub openrouter: AuthKind,
+    pub opencode_go: AuthKind,
+}
+
+impl AuthSnapshot {
+    /// The source for one provider id.
+    pub fn for_provider(&self, provider: &str) -> AuthKind {
+        if provider.eq_ignore_ascii_case("opencode-go")
+            || provider.eq_ignore_ascii_case("opencode")
+            || provider.eq_ignore_ascii_case("opencode_go")
+        {
+            self.opencode_go
+        } else {
+            self.openrouter
+        }
+    }
+
+    /// Whether any provider has a credential.
+    pub fn any_connected(&self) -> bool {
+        self.openrouter != AuthKind::Missing || self.opencode_go != AuthKind::Missing
+    }
 }
 
 /// The TUI end of the connection plus the question router for the agent.
@@ -301,7 +378,7 @@ pub fn bridge() -> (TuiBridge, TuiEndpoints) {
     let (catalog_tx, catalog_rx) = watch::channel(CatalogSnapshot::Pending);
     let (mcp_tx, mcp_rx) = watch::channel(McpSnapshot::Pending);
     let (reasoning_tx, reasoning_rx) = watch::channel(ReasoningSnapshot::Pending);
-    let (auth_tx, auth_rx) = watch::channel(AuthSnapshot::Missing);
+    let (auth_tx, auth_rx) = watch::channel(AuthSnapshot::default());
     let (sessions_tx, sessions_rx) = watch::channel(SessionSnapshot::Pending);
     let (skills_tx, skills_rx) = watch::channel(SkillsSnapshot::default());
     let (files_tx, files_rx) = watch::channel(ProjectFilesSnapshot::default());

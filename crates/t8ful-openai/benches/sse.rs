@@ -6,7 +6,7 @@
 use divan::counter::BytesCount;
 use divan::{Bencher, black_box};
 
-use t8ful_openrouter::sse::SseDecoder;
+use t8ful_openai::sse::SseDecoder;
 
 fn main() {
     divan::main();

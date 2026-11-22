@@ -326,8 +326,20 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, selected: usiz
         } else {
             Style::default().fg(theme.fg)
         };
+        // The provider is what tells two identical ids apart, so it is always
+        // shown; dim so it never competes with the id itself.
+        let source = model.provider.as_deref().unwrap_or_default();
+        let suffix = if source.is_empty() {
+            Span::raw("")
+        } else {
+            Span::styled(format!(" [{source}]"), Style::default().fg(theme.dim))
+        };
 
-        lines.push(Line::from(Span::styled(format!("{marker}{model}"), style)));
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(model.id.clone(), style),
+            suffix,
+        ]));
     }
 
     lines.push(Line::from(""));
@@ -1142,6 +1154,9 @@ fn render_transcript(
             continue;
         };
 
+        // The image starts at the content column, which is one past the card's
+        // gutter. The reserved width already accounts for that offset, so the
+        // rectangle covers the whole reservation.
         let rect = Rect::new(
             area.x + 1,
             area.y + (visible_start - start) as u16,
@@ -1689,11 +1704,8 @@ fn render_login(frame: &mut Frame, area: Rect, state: &AppState, login: &crate::
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(theme.dim);
     let text = Style::default().fg(theme.fg);
-    let source = match state.auth {
-        crate::bridge::AuthSnapshot::Environment => "environment",
-        crate::bridge::AuthSnapshot::Stored => "stored in auth.json",
-        crate::bridge::AuthSnapshot::Missing => "not connected",
-    };
+    let source = state.auth.for_provider(&login.provider).label();
+    let variable = crate::state::login_environment_variable(&login.provider);
     let masked = login.masked();
     let lines = vec![
         Line::from(Span::styled(format!("login {}", login.provider), title)),
@@ -1703,7 +1715,7 @@ fn render_login(frame: &mut Frame, area: Rect, state: &AppState, login: &crate::
             Span::styled(source, text),
         ]),
         Line::from(Span::styled(
-            "OPENROUTER_API_KEY overrides a stored key while it is set",
+            format!("{variable} overrides a stored key while it is set"),
             dim,
         )),
         Line::from(""),
@@ -2178,13 +2190,7 @@ impl TranscriptLayout {
             if let Entry::Images(images) = entry {
                 self.push_images_entry(images);
             } else {
-                self.push_entry(build_entry(
-                    entry,
-                    self.content_width,
-                    &self.theme,
-                    self.show_reasoning,
-                    self.expanded,
-                ));
+                self.push_entry_layout(entry);
             }
         }
 
@@ -2270,8 +2276,42 @@ impl TranscriptLayout {
         }
     }
 
+    /// Append one committed entry, registering any image rows it carries.
+    ///
+    /// A tool card that returned images keeps them inside its own entry, so the
+    /// same layout code that renders a submitted image block reserves the rows.
+    fn push_entry_layout(&mut self, entry: &Entry) {
+        let index = self.entries.len();
+        let (layout, placements) = build_entry_with_images(
+            entry,
+            self.content_width,
+            &self.theme,
+            self.show_reasoning,
+            self.expanded,
+            &mut self.previews,
+        );
+
+        self.push_entry(layout);
+
+        for (offset, key, columns, rows) in placements {
+            self.image_placements.push(ImagePlacement {
+                entry: index,
+                offset,
+                columns,
+                rows,
+                key,
+            });
+        }
+    }
+
     /// Re-render the entries a display toggle affects.
+    ///
+    /// A card that returned images carries preview rows, so it is rebuilt with
+    /// its placements in one pass: rebuilding it without them would store a
+    /// layout whose lines no longer match the row offsets the renderer paints.
     fn rebuild_entries(&mut self, state: &AppState, rebuild: impl Fn(&Entry) -> bool) {
+        let mut rebuilt = Vec::new();
+
         for (index, entry) in state.entries.iter().enumerate() {
             if !rebuild(entry) {
                 continue;
@@ -2281,17 +2321,43 @@ impl TranscriptLayout {
                 continue;
             };
 
-            *layout = build_entry(
+            let (built, placements) = build_entry_with_images(
                 entry,
                 self.content_width,
                 &self.theme,
                 self.show_reasoning,
                 self.expanded,
+                &mut self.previews,
             );
+
+            *layout = built;
+            rebuilt.push((index, placements));
 
             #[cfg(test)]
             {
                 self.entry_builds += 1;
+            }
+        }
+
+        if rebuilt.is_empty() {
+            return;
+        }
+
+        let indices = rebuilt.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+
+        // Stale placements would paint over line numbers the rebuild moved.
+        self.image_placements
+            .retain(|placement| !indices.contains(&placement.entry));
+
+        for (index, placements) in rebuilt {
+            for (offset, key, columns, rows) in placements {
+                self.image_placements.push(ImagePlacement {
+                    entry: index,
+                    offset,
+                    columns,
+                    rows,
+                    key,
+                });
             }
         }
     }
@@ -2334,6 +2400,9 @@ impl TranscriptLayout {
                     title: &run.title,
                     preview: &run.preview,
                     duration: None,
+                    // A live card is a call in flight; a result that carried
+                    // images commits its own card once it arrives.
+                    images: &[],
                     width: content_width,
                     theme: &theme,
                     expanded,
@@ -2862,7 +2931,7 @@ fn plain_entry(
     let mut lines = Vec::new();
     let mut bands = Vec::new();
 
-    for (index, (start, end)) in wrap_ranges(text, body_width).into_iter().enumerate() {
+    for (index, (start, end)) in visible_ranges(text, body_width).into_iter().enumerate() {
         let lead = if index == 0 {
             prefix.to_owned()
         } else {
@@ -2883,29 +2952,39 @@ fn plain_entry(
     }
 }
 
-fn build_entry(
+/// Build one entry's layout, returning the image rows it reserved.
+///
+/// `previews` receives a decode request for every image the entry renders, so an
+/// entry carrying images can report the widget rectangles the renderer paints.
+/// Every caller reserves the rows: a layout built without them would disagree
+/// with the placements the renderer paints.
+fn build_entry_with_images(
     entry: &Entry,
     width: usize,
     theme: &Theme,
     show_reasoning: bool,
     expanded: bool,
-) -> EntryLayout {
+    previews: &mut ImagePreviews,
+) -> (EntryLayout, Vec<(usize, PreviewKey, u16, u16)>) {
     match entry {
-        Entry::User(text) => plain_entry(
-            text,
-            width,
-            " ▍ ",
-            Style::default().fg(theme.accent),
-            Style::default().fg(theme.fg),
-            theme.user_bg,
+        Entry::User(text) => (
+            plain_entry(
+                text,
+                width,
+                " ▍ ",
+                Style::default().fg(theme.accent),
+                Style::default().fg(theme.fg),
+                theme.user_bg,
+            ),
+            Vec::new(),
         ),
-        Entry::Images(images) => images_entry(images, width, theme),
-        Entry::Assistant(text) => markdown_entry(text, width, theme),
+        Entry::Images(images) => images_layout(images, width, theme, previews),
+        Entry::Assistant(text) => (markdown_entry(text, width, theme), Vec::new()),
         Entry::Reasoning(text) => {
             if show_reasoning {
-                reasoning_entry(text, width, theme)
+                (reasoning_entry(text, width, theme), Vec::new())
             } else {
-                EntryLayout::default()
+                (EntryLayout::default(), Vec::new())
             }
         }
         Entry::Tool {
@@ -2915,38 +2994,54 @@ fn build_entry(
             title,
             preview,
             duration,
+            images,
             ..
-        } => build_tool(ToolLayout {
-            name,
-            status,
-            content,
+        } => build_card(
+            ToolLayout {
+                name,
+                status,
+                content,
+                title,
+                preview,
+                duration: *duration,
+                images,
+                width,
+                theme,
+                expanded,
+                cache: None,
+            },
+            previews,
+        ),
+        Entry::Info(text) => (
+            plain_entry(
+                text,
+                width,
+                " · ",
+                Style::default().fg(theme.dim),
+                Style::default().fg(theme.dim),
+                None,
+            ),
+            Vec::new(),
+        ),
+        Entry::Notice {
             title,
-            preview,
-            duration: *duration,
-            width,
-            theme,
-            expanded,
-            cache: None,
-        }),
-        Entry::Info(text) => plain_entry(
-            text,
-            width,
-            " · ",
-            Style::default().fg(theme.dim),
-            Style::default().fg(theme.dim),
-            None,
+            body,
+            status,
+        } => (notice_entry(title, body, status, width, theme), Vec::new()),
+        Entry::Error(text) => (
+            plain_entry(
+                text,
+                width,
+                " error: ",
+                Style::default().fg(theme.error),
+                Style::default().fg(theme.error),
+                None,
+            ),
+            Vec::new(),
         ),
-        Entry::Error(text) => plain_entry(
-            text,
-            width,
-            " error: ",
-            Style::default().fg(theme.error),
-            Style::default().fg(theme.error),
-            None,
-        ),
-        Entry::Plan { body, mode, .. } => plan_entry(body, *mode, width, theme),
-        Entry::ModeChange { from, to } => mode_change_entry(*from, *to, width, theme),
-        Entry::Startup { version } => startup_entry(version, width, theme),
+        Entry::Plan { body, mode, .. } => (plan_entry(body, *mode, width, theme), Vec::new()),
+        Entry::ModeChange { from, to } => (mode_change_entry(*from, *to, width, theme), Vec::new()),
+        Entry::Startup { version } => (startup_entry(version, width, theme), Vec::new()),
         Entry::Agent {
             id,
             role,
@@ -2957,21 +3052,24 @@ fn build_entry(
             branch,
             prompt,
             report,
-        } => agent_entry(
-            AgentCard {
-                id,
-                role,
-                status,
-                isolation,
-                task: task.as_deref(),
-                worktree: worktree.as_deref(),
-                branch: branch.as_deref(),
-                prompt,
-                report: report.as_deref(),
-            },
-            width,
-            theme,
-            expanded,
+        } => (
+            agent_entry(
+                AgentCard {
+                    id,
+                    role,
+                    status,
+                    isolation,
+                    task: task.as_deref(),
+                    worktree: worktree.as_deref(),
+                    branch: branch.as_deref(),
+                    prompt,
+                    report: report.as_deref(),
+                },
+                width,
+                theme,
+                expanded,
+            ),
+            Vec::new(),
         ),
     }
 }
@@ -3110,11 +3208,72 @@ fn markdown_entry(text: &str, width: usize, theme: &Theme) -> EntryLayout {
         lines.push(Line::from(spans));
     }
 
-    if lines.is_empty() {
-        lines.push(Line::from(" "));
+    // Whitespace-only text renders nothing and must cost nothing: an entry with
+    // no rows adds no separator either, so a stray empty message can never open
+    // a gap between the cards around it.
+    let bands = vec![None; lines.len()];
+
+    EntryLayout {
+        lines,
+        bands,
+        gutter: 1,
+    }
+}
+
+/// A restored notice as a banded card: the same chrome a live tool card uses,
+/// so a process exit or a child report reads the way it did when it arrived.
+fn notice_entry(title: &str, body: &str, status: &str, width: usize, theme: &Theme) -> EntryLayout {
+    let band = theme.tool_bg;
+    let bare = band.is_none();
+    let lead = if bare { "▏" } else { " " };
+    let lead_style = if bare {
+        Style::default().fg(theme.tool)
+    } else {
+        Style::default()
+    };
+    let glyph_style = Style::default().fg(tool_status_color(status, theme));
+    let label_style = Style::default().fg(theme.fg);
+    let dim = Style::default().fg(theme.dim);
+    let mut lines = Vec::new();
+    let mut bands = Vec::new();
+    let label_width = width.saturating_sub(3).max(1);
+
+    for (index, (start, end)) in visible_ranges(title, label_width).into_iter().enumerate() {
+        let text = &title[start..end];
+        let mut spans = vec![Span::styled(lead, lead_style)];
+
+        if index == 0 {
+            spans.push(Span::styled(tool_glyph(status), glyph_style));
+            spans.push(Span::styled(format!(" {text}"), label_style));
+        } else {
+            spans.push(Span::styled(format!("   {text}"), label_style));
+        }
+
+        lines.push(Line::from(spans));
+        bands.push(band);
     }
 
-    let bands = vec![None; lines.len()];
+    let body_width = width.saturating_sub(1).max(1);
+
+    // An empty body draws no banded row at all: a row nobody can read is the
+    // blank-card defect this layout exists to avoid.
+    if body.trim().is_empty() {
+        let bands = vec![band; lines.len()];
+
+        return EntryLayout {
+            lines,
+            bands,
+            gutter: 1,
+        };
+    }
+
+    for (start, end) in visible_ranges(body, body_width) {
+        lines.push(Line::from(vec![
+            Span::styled(lead, lead_style),
+            Span::styled(body[start..end].to_owned(), dim),
+        ]));
+        bands.push(band);
+    }
 
     EntryLayout {
         lines,
@@ -3308,11 +3467,45 @@ struct ToolLayout<'a> {
     title: &'a str,
     preview: &'a ToolPreview,
     duration: Option<Duration>,
+    /// Images the call returned, rendered under the body.
+    images: &'a [t8ful_core::content::ImageInput],
     width: usize,
     theme: &'a Theme,
     expanded: bool,
     /// Wrapping of a growing body, reused across frames while the tool runs.
     cache: Option<&'a mut WrapCache>,
+}
+
+/// A tool card with the images its result carried.
+///
+/// The card body is built exactly as it would be alone; the image captions and
+/// preview rows are appended to the same entry so a returned screenshot stays
+/// attached to the call that read it.
+fn build_card(
+    layout: ToolLayout<'_>,
+    previews: &mut ImagePreviews,
+) -> (EntryLayout, Vec<(usize, PreviewKey, u16, u16)>) {
+    let images = layout.images;
+    let width = layout.width;
+    let theme = layout.theme;
+    let mut card = build_tool(layout);
+
+    if images.is_empty() {
+        return (card, Vec::new());
+    }
+
+    let (block, placements) = images_layout(images, width, theme, previews);
+    let offset = card.lines.len();
+
+    card.lines.extend(block.lines);
+    card.bands.extend(block.bands);
+
+    let placements = placements
+        .into_iter()
+        .map(|(at, key, columns, rows)| (offset + at, key, columns, rows))
+        .collect();
+
+    (card, placements)
 }
 
 /// Lay out image captions and the cell rows their previews occupy.
@@ -3326,9 +3519,10 @@ fn images_layout(
     let mut lines = Vec::new();
     let mut bands = Vec::new();
     let mut placements = Vec::new();
-    let max_columns = width
-        .saturating_sub(2)
-        .clamp(1, crate::images::MAX_PREVIEW_COLUMNS as usize) as u16;
+    // `width` is already the transcript content width. The renderer draws at
+    // `area.x + 1` (the card's gutter column), so a preview this wide ends one
+    // column short of the right edge and never overflows the area.
+    let max_columns = width.clamp(1, crate::images::MAX_PREVIEW_COLUMNS as usize) as u16;
 
     for (index, image) in images.iter().enumerate() {
         let name = image
@@ -3389,42 +3583,6 @@ fn images_layout(
     )
 }
 
-/// Caption-only fallback for an image block outside the transcript layout.
-fn images_entry(
-    images: &[t8ful_core::content::ImageInput],
-    width: usize,
-    theme: &Theme,
-) -> EntryLayout {
-    let mut lines = Vec::new();
-
-    for (index, image) in images.iter().enumerate() {
-        let caption = format!(
-            " [{}] {} {}x{} · {} · {}",
-            index + 1,
-            crate::images::media_label(&image.media_type),
-            image.width,
-            image.height,
-            crate::images::human_bytes(image.bytes),
-            image
-                .path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| image.path.display().to_string())
-        );
-
-        lines.push(Line::from(Span::styled(
-            elide(&caption, width.max(1)),
-            Style::default().fg(theme.dim),
-        )));
-    }
-
-    EntryLayout {
-        bands: vec![None; lines.len()],
-        lines,
-        gutter: 1,
-    }
-}
-
 fn build_tool(layout: ToolLayout<'_>) -> EntryLayout {
     let ToolLayout {
         name,
@@ -3437,6 +3595,7 @@ fn build_tool(layout: ToolLayout<'_>) -> EntryLayout {
         theme,
         expanded,
         cache,
+        ..
     } = layout;
 
     let band = theme.tool_bg;
@@ -3547,7 +3706,7 @@ fn build_tool(layout: ToolLayout<'_>) -> EntryLayout {
             bands.push(band);
         } else if !collapsible && subtitle_shown {
             // Keep every error line visible, not only the summary subtitle.
-            for (start, end) in wrap_ranges(content, body_width).into_iter().skip(1) {
+            for (start, end) in visible_ranges(content, body_width).into_iter().skip(1) {
                 lines.push(Line::from(vec![
                     Span::styled(lead, lead_style),
                     Span::styled(content[start..end].to_owned(), dim),
@@ -3585,7 +3744,7 @@ fn build_tool(layout: ToolLayout<'_>) -> EntryLayout {
             cache.page(content, tail)
         }
         None => {
-            let ranges = wrap_ranges(content, body_width);
+            let ranges = visible_ranges(content, body_width);
             let total = ranges.len();
             let skip = tail.map_or(0, |tail| total.saturating_sub(tail));
 
@@ -3657,23 +3816,51 @@ fn expanded_affects(entry: &Entry, width: usize) -> bool {
         || wraps_past(&preview.text, body_width, PREVIEW_COLLAPSED_LINES)
 }
 
-/// Whether `content` wraps to more than `limit` rows at `width`.
+/// Whether `content` wraps to more than `limit` visible rows at `width`.
 ///
-/// Counts rows exactly as [`wrap_ranges`] would, but stops at the first row past
-/// the limit and allocates nothing, because only the answer matters here.
+/// Counts rows exactly as [`visible_ranges`] would — trailing blank rows do not
+/// count, interior ones do — and stops as soon as a visible row past the limit
+/// settles the answer, so a megabyte of output costs nothing to test.
 fn wraps_past(content: &str, width: usize, limit: usize) -> bool {
     let width = width.max(1);
-    let mut rows = 0;
+    let mut row = 0;
+    let mut column = 0;
+    let mut blank = true;
+    // Index of the last row carrying visible content; every row after it is
+    // trimmed away, and an all-blank body still occupies one row.
+    let mut last_visible: Option<usize> = None;
 
-    for segment in content.split('\n') {
-        rows += segment.chars().count().max(1).div_ceil(width);
+    for character in content.chars() {
+        // A newline closes the row it terminates, and an over-long row closes
+        // itself before the character that would have overflowed it. A newline
+        // takes precedence: it is never part of the row it ends.
+        if character == '\n' || column == width {
+            if !blank {
+                last_visible = Some(row);
 
-        if rows > limit {
-            return true;
+                if row >= limit {
+                    return true;
+                }
+            }
+
+            row += 1;
+            column = 0;
+            blank = true;
+
+            if character == '\n' {
+                continue;
+            }
         }
+
+        blank &= character.is_whitespace();
+        column += 1;
     }
 
-    false
+    if !blank {
+        last_visible = Some(row);
+    }
+
+    last_visible.map_or(1, |row| row + 1) > limit
 }
 
 /// Whether a tool-level success actually reports a failed command.
@@ -3748,7 +3935,7 @@ fn diff_preview_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'stat
             continue;
         }
 
-        for (start, end) in wrap_ranges(line, width) {
+        for (start, end) in visible_ranges(line, width) {
             lines.push(Line::from(Span::styled(line[start..end].to_owned(), style)));
         }
     }
@@ -3846,6 +4033,37 @@ pub fn wrap_ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
+/// [`wrap_ranges`] minus the trailing rows that render nothing.
+///
+/// A body ending in newline(s) produces empty tail ranges; drawing them paints
+/// blank rows under every card, so a tool result ending in `\n` would grow a
+/// phantom banded row. Interior blank rows are untouched: they are the paragraph
+/// separators inside tool output. One row is always kept, so an empty body still
+/// occupies a line.
+pub fn visible_ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
+    let mut ranges = wrap_ranges(text, width);
+
+    trim_blank_rows(text, &mut ranges);
+
+    ranges
+}
+
+/// Drop the trailing blank rows of `ranges`, which index into `text`.
+///
+/// Shared by every layout path that draws a body, so the rows a card draws and
+/// the rows its collapse marker counts always follow one rule.
+fn trim_blank_rows(text: &str, ranges: &mut Vec<(usize, usize)>) {
+    while ranges.len() > 1 {
+        let (start, end) = ranges[ranges.len() - 1];
+
+        if !text[start..end].trim().is_empty() {
+            break;
+        }
+
+        ranges.pop();
+    }
+}
+
 /// Start of the line still being written, which is the text after the last
 /// newline.
 fn last_line_start(text: &str) -> usize {
@@ -3923,28 +4141,43 @@ impl WrapCache {
     ///
     /// `tail` limits the returned rows to the last `tail` rows of the body,
     /// which is what a collapsed card shows; the count is always complete so the
-    /// marker can report the hidden lines.
+    /// marker can report the hidden lines. Both the count and the rows exclude
+    /// the trailing blank rows [`visible_ranges`] drops, so the marker can never
+    /// name rows this card does not draw.
     pub fn page(&mut self, content: &str, tail: Option<usize>) -> (usize, Vec<(usize, usize)>) {
         self.sync(content);
 
-        let tail_ranges = wrap_ranges(&content[self.stable_len..], self.width);
-        let total = self.ranges.len() + tail_ranges.len();
-        let skip = tail.map_or(0, |tail| total.saturating_sub(tail));
-        let mut rows = Vec::with_capacity(total - skip);
+        let stable = self.ranges.len();
+        let base = self.stable_len;
+        let tail_ranges = wrap_ranges(&content[base..], self.width);
+        let combined = stable + tail_ranges.len();
+        // The cache keeps every range so a later append can extend it, so the
+        // trailing blank rows are counted here rather than removed.
+        let range = |index: usize| {
+            if index < stable {
+                self.ranges[index]
+            } else {
+                let (start, end) = tail_ranges[index - stable];
 
-        if skip < self.ranges.len() {
-            rows.extend_from_slice(&self.ranges[skip..]);
+                (start + base, end + base)
+            }
+        };
+        let mut visible = combined;
+
+        while visible > 1 {
+            let (start, end) = range(visible - 1);
+
+            if !content[start..end].trim().is_empty() {
+                break;
+            }
+
+            visible -= 1;
         }
 
-        let first_tail = skip.saturating_sub(self.ranges.len());
+        let skip = tail.map_or(0, |tail| visible.saturating_sub(tail));
+        let rows = (skip..visible).map(range).collect();
 
-        rows.extend(
-            tail_ranges[first_tail..]
-                .iter()
-                .map(|(start, end)| (start + self.stable_len, end + self.stable_len)),
-        );
-
-        (total, rows)
+        (visible, rows)
     }
 
     /// Wrap the newly finished lines of `content` into the cache.
@@ -4010,9 +4243,9 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        ToolLayout, TranscriptLayout, WrapCache, attachment_tray_lines, build_tool, busy_line,
-        composer_layout, composer_lines, composer_rows, cursor_offset, cursor_offset_at,
-        images_layout, wrap_ranges,
+        COLLAPSED_TOOL_LINES, ToolLayout, TranscriptLayout, WrapCache, attachment_tray_lines,
+        build_tool, busy_line, composer_layout, composer_lines, composer_rows, cursor_offset,
+        cursor_offset_at, images_layout, visible_ranges, wrap_ranges,
     };
     use crate::state::ToolPreview;
     use crate::state::{AppState, CardPlacement, Entry, Header};
@@ -4044,6 +4277,218 @@ mod tests {
     fn wraps_long_text_at_the_requested_width() {
         assert_eq!(ranges("abcdef", 3), vec!["abc", "def"]);
         assert_eq!(ranges("ab\n\ncd", 4), vec!["ab", "", "cd"]);
+    }
+
+    #[test]
+    fn a_card_body_ending_in_newline_adds_no_blank_rows() {
+        let state = state(Vec::new());
+        let theme = &state.theme;
+        let base = "line one\nline two is longer than nothing";
+
+        let expected = build_tool(ToolLayout {
+            name: "bash",
+            status: "ok",
+            content: base,
+            title: "cargo fmt",
+            preview: &ToolPreview::default(),
+            duration: None,
+            images: &[],
+            width: 40,
+            theme,
+            expanded: true,
+            cache: None,
+        });
+
+        for body in [
+            format!("{base}\n"),
+            format!("{base}\n\n"),
+            format!("{base}\n\n\n"),
+        ] {
+            for expanded in [true, false] {
+                let built = build_tool(ToolLayout {
+                    name: "bash",
+                    status: "ok",
+                    content: &body,
+                    title: "cargo fmt",
+                    preview: &ToolPreview::default(),
+                    duration: None,
+                    images: &[],
+                    width: 40,
+                    theme,
+                    expanded,
+                    cache: None,
+                });
+
+                assert_eq!(built.lines, expected.lines, "{body:?} expanded {expanded}");
+                assert_eq!(built.bands, expected.bands, "{body:?} expanded {expanded}");
+            }
+
+            // The cached card must agree with the uncached one.
+            let mut cache = WrapCache::new(39);
+            let cached = build_tool(ToolLayout {
+                name: "bash",
+                status: "ok",
+                content: &body,
+                title: "cargo fmt",
+                preview: &ToolPreview::default(),
+                duration: None,
+                images: &[],
+                width: 40,
+                theme,
+                expanded: true,
+                cache: Some(&mut cache),
+            });
+
+            assert_eq!(cached.lines, expected.lines, "{body:?} cached");
+        }
+
+        // The same rule covers plain rows: an info line ending in a newline is
+        // one row, not two.
+        let plain = |text: &str| {
+            super::plain_entry(
+                text,
+                40,
+                " · ",
+                ratatui::style::Style::default(),
+                ratatui::style::Style::default(),
+                None,
+            )
+        };
+        let whole = plain("restored 3 entries");
+
+        assert_eq!(plain("restored 3 entries\n").lines, whole.lines);
+        assert_eq!(plain("restored 3 entries\n\n").bands, whole.bands);
+    }
+
+    #[test]
+    fn interior_blank_rows_inside_tool_output_are_kept() {
+        let state = state(Vec::new());
+        let built = build_tool(ToolLayout {
+            name: "bash",
+            status: "ok",
+            content: "first paragraph\n\nsecond paragraph\n",
+            title: "",
+            preview: &ToolPreview::default(),
+            duration: None,
+            images: &[],
+            width: 40,
+            theme: &state.theme,
+            expanded: true,
+            cache: None,
+        });
+        let text = built
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("first paragraph"), "{text}");
+        assert!(text.contains("second paragraph"), "{text}");
+        // Header, first paragraph, the separator, second paragraph.
+        assert_eq!(built.lines.len(), 4, "{text}");
+        assert!(
+            built.lines[2].to_string().trim().is_empty(),
+            "the paragraph separator was dropped: {text}"
+        );
+    }
+
+    #[test]
+    fn the_collapse_marker_counts_the_rows_actually_hidden() {
+        let state = state(Vec::new());
+        let body = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n\n\n";
+        let built = build_tool(ToolLayout {
+            name: "bash",
+            status: "ok",
+            content: body,
+            title: "",
+            preview: &ToolPreview::default(),
+            duration: None,
+            images: &[],
+            width: 40,
+            theme: &state.theme,
+            expanded: false,
+            cache: None,
+        });
+        let expanded = build_tool(ToolLayout {
+            name: "bash",
+            status: "ok",
+            content: body,
+            title: "",
+            preview: &ToolPreview::default(),
+            duration: None,
+            images: &[],
+            width: 40,
+            theme: &state.theme,
+            expanded: true,
+            cache: None,
+        });
+        let marker = built.lines[1].to_string();
+        let hidden = marker
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .and_then(|(count, _)| count.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("a collapse marker: {marker}"));
+
+        // Header + marker + the collapsed window; the two trailing newlines
+        // are rows nobody can see and must not be counted as hidden.
+        assert_eq!(built.lines.len(), 2 + COLLAPSED_TOOL_LINES, "{marker}");
+        assert_eq!(expanded.lines.len(), 1 + 7, "the separator row is kept");
+        assert_eq!(hidden, 7 - COLLAPSED_TOOL_LINES, "{marker}");
+        assert_eq!(hidden + COLLAPSED_TOOL_LINES, expanded.lines.len() - 1);
+    }
+
+    #[test]
+    fn a_whitespace_only_assistant_message_occupies_no_rows() {
+        let mut state = state(vec![tool("first\n", "ok")]);
+        let mut layout = TranscriptLayout::default();
+
+        layout.sync(&state, 40);
+
+        let before = plain(&state, &layout);
+
+        state.apply_event(t8ful_core::event::AgentEvent::TextCompleted {
+            text: "\n\n".to_owned(),
+        });
+        state.entries.push(tool("second\n", "ok"));
+        layout.sync(&state, 40);
+
+        let after = plain(&state, &layout);
+        // Two cards with exactly one separator row between them.
+        assert_eq!(before.len(), 2, "{before:?}");
+        assert_eq!(after.len(), before.len() + 2 + 1, "{after:?}",);
+        assert!(
+            after[2].trim().is_empty(),
+            "the only blank row is the separator: {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_reasoning_message_occupies_no_rows() {
+        let mut state = state(vec![tool("first\n", "ok")]);
+        let mut layout = TranscriptLayout::default();
+
+        state.show_reasoning = true;
+        layout.sync(&state, 40);
+
+        let before = plain(&state, &layout);
+
+        state.apply_event(t8ful_core::event::AgentEvent::ReasoningDelta {
+            text: "\n\n".to_owned(),
+        });
+        state.apply_event(t8ful_core::event::AgentEvent::TextCompleted {
+            text: String::new(),
+        });
+        state.entries.push(tool("second\n", "ok"));
+        layout.sync(&state, 40);
+
+        let after = plain(&state, &layout);
+
+        assert_eq!(after.len(), before.len() + 2 + 1, "{after:?}");
+        assert!(
+            after[2].trim().is_empty(),
+            "the only blank row is the separator: {after:?}"
+        );
     }
 
     #[test]
@@ -4079,14 +4524,16 @@ mod tests {
                     }
 
                     let prefix = &text[..end];
-                    let expected = wrap_ranges(prefix, width);
+                    // The cache feeds the layout, so it has to agree with the
+                    // rows a card draws, not with the raw ranges.
+                    let expected = visible_ranges(prefix, width);
                     let (total, rows) = cache.page(prefix, None);
 
                     assert_eq!(total, expected.len(), "{text:?} w{width} @{end}");
                     assert_eq!(rows, expected, "{text:?} w{width} @{end}");
                 }
 
-                let fresh = wrap_ranges(text, width);
+                let fresh = visible_ranges(text, width);
                 let (total, tail) = cache.page(text, Some(2));
 
                 assert_eq!(total, fresh.len(), "{text:?} w{width}");
@@ -4107,10 +4554,46 @@ mod tests {
         cache.page(text, None);
         cache.set_width(3);
 
-        let expected = wrap_ranges(text, 3);
+        let expected = visible_ranges(text, 3);
         let (total, rows) = cache.page(text, None);
 
         assert_eq!((total, rows), (expected.len(), expected));
+    }
+
+    #[test]
+    fn the_wraps_past_count_agrees_with_the_rows_a_card_draws() {
+        // `wraps_past` decides whether ctrl-o can change a card, and
+        // `visible_ranges` decides what it draws; disagreement leaves a card
+        // behind a marker it never honours, or rebuilds it for nothing.
+        let corpus = [
+            "",
+            "\n",
+            "\n\n\n",
+            "a",
+            "a\n",
+            "a\n\n",
+            "a\nb\nc\nd\ne",
+            "a\nb\nc\nd\ne\n",
+            "a\nb\nc\nd\ne\n\n\n",
+            "a\n\nb\n\nc\n\nd",
+            "  \n \n",
+            "1234567890\n",
+            "123456789012345678901234567890",
+        ];
+
+        for text in corpus {
+            for width in [1, 3, 5, 10] {
+                let rows = visible_ranges(text, width).len();
+
+                for limit in 0..8 {
+                    assert_eq!(
+                        super::wraps_past(text, width, limit),
+                        rows > limit,
+                        "{text:?} w{width} limit {limit}: {rows} rows"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4127,6 +4610,7 @@ mod tests {
                     title: "",
                     preview: &ToolPreview::default(),
                     duration: None,
+                    images: &[],
                     width,
                     theme: &state.theme,
                     expanded,
@@ -4147,6 +4631,7 @@ mod tests {
                         title: "",
                         preview: &ToolPreview::default(),
                         duration: None,
+                        images: &[],
                         width,
                         theme: &state.theme,
                         expanded,
@@ -4441,9 +4926,7 @@ mod tests {
         assert!(text.contains("decoding preview…"), "{text}");
         assert!(placements.is_empty(), "a pending preview is not renderable");
 
-        let max_columns = 70_usize
-            .saturating_sub(2)
-            .clamp(1, crate::images::MAX_PREVIEW_COLUMNS as usize) as u16;
+        let max_columns = 70_usize.clamp(1, crate::images::MAX_PREVIEW_COLUMNS as usize) as u16;
         let (_, rows) = crate::images::fit_preview(
             640,
             480,
@@ -4514,6 +4997,7 @@ mod tests {
             preview: ToolPreview::default(),
             duration: None,
             placement: CardPlacement::default(),
+            images: Vec::new(),
         }
     }
 
@@ -4637,6 +5121,7 @@ héllo → wörld supercalifragilisticexpialidocious\n";
             preview: ToolPreview::default(),
             duration: None,
             placement: CardPlacement::default(),
+            images: Vec::new(),
         };
         let mut state = state(vec![entry]);
         let mut layout = TranscriptLayout::default();
@@ -4676,6 +5161,7 @@ héllo → wörld supercalifragilisticexpialidocious\n";
             content: "- Updated: about 1 month ago".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         layout.sync(&state, 60);
@@ -4712,6 +5198,7 @@ héllo → wörld supercalifragilisticexpialidocious\n";
             preview: ToolPreview::default(),
             duration: None,
             placement: CardPlacement::default(),
+            images: Vec::new(),
         }]);
         let mut layout = TranscriptLayout::default();
 
@@ -4884,6 +5371,7 @@ héllo → wörld supercalifragilisticexpialidocious\n";
             },
             duration: None,
             placement: CardPlacement::default(),
+            images: Vec::new(),
         }
     }
 
@@ -4926,6 +5414,7 @@ héllo → wörld supercalifragilisticexpialidocious\n";
             preview: ToolPreview::default(),
             duration: None,
             placement: CardPlacement::default(),
+            images: Vec::new(),
         };
         let state = state(vec![entry]);
         let mut layout = TranscriptLayout::default();
@@ -4963,6 +5452,7 @@ héllo → wörld supercalifragilisticexpialidocious\n";
             preview: ToolPreview::default(),
             duration: None,
             placement: CardPlacement::default(),
+            images: Vec::new(),
         }]);
         let mut layout = TranscriptLayout::default();
 
@@ -4989,6 +5479,7 @@ héllo → wörld supercalifragilisticexpialidocious\n";
             preview: ToolPreview::default(),
             duration: None,
             placement: CardPlacement::default(),
+            images: Vec::new(),
         }]);
         let mut layout = TranscriptLayout::default();
 
@@ -5068,6 +5559,7 @@ héllo → wörld supercalifragilisticexpialidocious\n";
             content: "[exit code 0, 1.0s]\nrunning test one\nok".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
         layout.sync(&state, 60);
 
@@ -5092,6 +5584,7 @@ héllo → wörld supercalifragilisticexpialidocious\n";
             preview: ToolPreview::default(),
             duration: None,
             placement,
+            images: Vec::new(),
         }
     }
 
@@ -5165,6 +5658,7 @@ héllo → wörld supercalifragilisticexpialidocious\n";
             content: "started process-1".to_owned(),
             truncated: false,
             process_id: Some("process-1".to_owned()),
+            images: Vec::new(),
         });
         state.apply_event(t8ful_core::event::AgentEvent::TextCompleted {
             text: "LATER-TEXT".to_owned(),

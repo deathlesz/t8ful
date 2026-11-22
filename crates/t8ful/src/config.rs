@@ -17,7 +17,11 @@ use crate::root::RootInfo;
 use crate::trust::ProjectTrust;
 
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+/// Base URL of the OpenCode Go provider, which has no configurable endpoint.
+pub const DEFAULT_OPENCODE_GO_BASE_URL: &str = t8ful_opencode::DEFAULT_BASE_URL;
 pub const DEFAULT_PROVIDER: &str = "openrouter";
+/// The provider a bare, unresolvable model id defaults to.
+pub const OPENCODE_GO_PROVIDER: &str = t8ful_opencode::PROVIDER_ID;
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub const DEFAULT_CONTEXT_LIMIT_FALLBACK: u64 = t8ful_core::DEFAULT_CONTEXT_LIMIT_FALLBACK;
@@ -491,7 +495,13 @@ pub struct Settings {
     pub agents: AgentSettings,
     pub model: Option<String>,
     pub base_url: String,
-    pub api_key: Option<String>,
+    /// OpenRouter credential. The environment pairs with `base_url`; the Go
+    /// credential has no configurable endpoint.
+    pub openrouter_api_key: Option<String>,
+    /// OpenCode Go credential, from `OPENCODE_GO_API_KEY` or `/login`.
+    pub opencode_go_api_key: Option<String>,
+    /// Provider a bare, unresolvable model id defaults to.
+    pub provider_kind: String,
     pub mode: Mode,
     pub reasoning_effort: ReasoningEffort,
     /// Per-model reasoning overrides keyed by model id or bare name.
@@ -727,7 +737,7 @@ pub enum ConfigError {
     )]
     ModelNotConfigured,
 
-    #[error("unsupported provider kind `{0}`; only `openrouter` is supported")]
+    #[error("unsupported provider kind `{0}`; use `openrouter` or `opencode-go`")]
     UnsupportedProvider(String),
 
     #[error("cannot read project instructions {path}: {source}")]
@@ -970,7 +980,7 @@ pub fn resolve(
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_owned())
         .to_ascii_lowercase();
 
-    if provider_kind != DEFAULT_PROVIDER {
+    if provider_kind != DEFAULT_PROVIDER && provider_kind != OPENCODE_GO_PROVIDER {
         return Err(ConfigError::UnsupportedProvider(provider_kind));
     }
 
@@ -982,8 +992,8 @@ pub fn resolve(
 
     if sends_credentials_in_plaintext(&base_url) {
         warnings.push(
-            "provider.base_url uses plaintext HTTP to a non-loopback host; the API key will be \
-             sent unencrypted"
+            "provider.base_url uses plaintext HTTP to a non-loopback host; the OpenRouter API key \
+             will be sent unencrypted"
                 .to_owned(),
         );
     }
@@ -1098,7 +1108,9 @@ pub fn resolve(
         launch_dir,
         model,
         base_url,
-        api_key: non_empty(env.get("OPENROUTER_API_KEY")),
+        openrouter_api_key: non_empty(env.get("OPENROUTER_API_KEY")),
+        opencode_go_api_key: non_empty(env.get("OPENCODE_GO_API_KEY")),
+        provider_kind,
         mode: merged.agent.mode.unwrap_or(Mode::Coding),
         reasoning_effort,
         reasoning_models: merged.agent.models,
@@ -1237,7 +1249,10 @@ mod tests {
     use t8ful_core::provider::ReasoningEffort;
     use tempfile::TempDir;
 
-    use super::{CliOverrides, ConfigError, ConfigPaths, DEFAULT_BASE_URL, EnvSource, resolve};
+    use super::{
+        CliOverrides, ConfigError, ConfigPaths, DEFAULT_BASE_URL, EnvSource, OPENCODE_GO_PROVIDER,
+        resolve,
+    };
     use crate::root::{RootInfo, RootSource};
 
     struct Fixture {
@@ -1427,7 +1442,7 @@ mod tests {
 
         assert_eq!(settings.model.as_deref(), Some("env/model"));
         assert_eq!(settings.base_url, "http://env");
-        assert_eq!(settings.api_key.as_deref(), Some("env-key"));
+        assert_eq!(settings.openrouter_api_key.as_deref(), Some("env-key"));
         assert!(
             settings
                 .warnings
@@ -1535,6 +1550,44 @@ mod tests {
             .expect_err("unsupported provider");
 
         assert!(matches!(error, ConfigError::UnsupportedProvider(_)));
+    }
+
+    #[test]
+    fn opencode_go_is_accepted_as_the_default_provider_kind() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+
+        fixture.write(
+            &paths.project,
+            "[provider]\nkind = \"opencode-go\"\nmodel = \"kimi-k3\"\n",
+        );
+
+        let settings = resolve_with(&fixture, CliOverrides::default(), &fixture.env(), true)
+            .expect("settings");
+
+        assert_eq!(settings.provider_kind, OPENCODE_GO_PROVIDER);
+    }
+
+    #[test]
+    fn the_go_key_is_read_from_its_own_variable() {
+        let fixture = Fixture::new();
+
+        let mut values = BTreeMap::from([
+            ("HOME".to_owned(), fixture.dir.path().display().to_string()),
+            ("T8FUL_MODEL".to_owned(), "vendor/model".to_owned()),
+        ]);
+        values.insert("OPENCODE_GO_API_KEY".to_owned(), "oc_sk_env".to_owned());
+
+        let settings = resolve_with(
+            &fixture,
+            CliOverrides::default(),
+            &EnvSource::Map(values),
+            true,
+        )
+        .expect("settings");
+
+        assert_eq!(settings.opencode_go_api_key.as_deref(), Some("oc_sk_env"));
+        assert_eq!(settings.openrouter_api_key, None);
     }
 
     #[test]

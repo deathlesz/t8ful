@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use t8ful_core::agent::{Agent, AgentConfig};
-use t8ful_core::compaction::ContextCompactor;
 use t8ful_core::context::{Projection, resolve_output_budget};
 use t8ful_core::message::Conversation;
 use t8ful_core::policy::{Mode, Policy};
@@ -17,7 +16,6 @@ use t8ful_core::question::QuestionRouter;
 use t8ful_core::readscope::ReadScope;
 use t8ful_core::sandbox::Sandbox;
 use t8ful_core::tool::{ToolContext, ToolRegistry};
-use t8ful_openrouter::OpenRouterClient;
 use t8ful_tools::recall::{RecallTool, SessionRecall};
 use t8ful_tools::{ManagedProcesses, builtin_registry};
 
@@ -25,6 +23,7 @@ use crate::children::RootView;
 use crate::compaction::ModelCompactor;
 use crate::config::{ConfigError, Settings};
 use crate::instructions::Instructions;
+use crate::providers::{Catalog, Route, RouteCell, RouteSelector, RoutingProvider};
 use crate::session::SessionJournal;
 use crate::skills::SkillCatalog;
 
@@ -208,6 +207,32 @@ pub fn resolve_catalog_model(models: &[ModelInfo], requested: &str) -> ModelReso
     ModelResolution::Unresolved
 }
 
+/// Match a requested id against one provider's copy of the catalog.
+///
+/// Duplicated ids exist in both catalogs, so a pinned provider must prefer its
+/// own row even when the other provider's row comes first.
+pub fn resolve_catalog_model_for(
+    models: &[ModelInfo],
+    requested: &str,
+    route: Route,
+) -> ModelResolution {
+    let requested = requested.trim();
+    let provider = route.id();
+    let scoped = models
+        .iter()
+        .filter(|info| info.provider.as_deref() == Some(provider))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if scoped.is_empty() {
+        // The catalog predates provenance tagging (or the provider contributed
+        // nothing): resolve against the whole list rather than failing.
+        return resolve_catalog_model(models, requested);
+    }
+
+    resolve_catalog_model(&scoped, requested)
+}
+
 fn model_tail(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
 }
@@ -252,9 +277,19 @@ pub struct Session {
     pub context_limit_override: Option<u64>,
     pub context_limit_fallback: u64,
     pub(crate) provider: Arc<dyn Provider>,
+    /// The routing façade behind `provider`, when the session was built around
+    /// both catalogs. `None` for a session built with a test provider.
+    pub(crate) routing: Option<Arc<RoutingProvider>>,
     pub(crate) catalog: CatalogState,
     pub(crate) catalog_timeout: Duration,
-    pub(crate) base_url: String,
+    /// The provider the selected model belongs to, so a request for a
+    /// duplicated id goes where the user picked.
+    pub(crate) selected_route: Option<Route>,
+    /// The same choice, seen by the agent's provider handle at request time.
+    pub(crate) route_cell: RouteCell,
+    /// A warning produced by the last picker selection, reported by the caller
+    /// that has an event stream to send it on.
+    selection_warning: Option<String>,
     /// Session-wide child agents, when the feature is enabled.
     pub agents: Option<Arc<crate::spawner::SpawnerState>>,
     /// The task graph shared with the task tools.
@@ -262,6 +297,9 @@ pub struct Session {
     /// The session later records go to, shared with the recall tool so it
     /// always skips the conversation the model already has.
     pub current_session: Arc<std::sync::Mutex<Option<String>>>,
+    /// Where a tool's returned images are stored, shared with `read_file` so it
+    /// always writes into the session that is live now.
+    pub attachments: Arc<crate::attachments::SessionAttachments>,
     /// Started MCP servers. Dropping the session shuts them down.
     pub mcp: t8ful_mcp::McpHub,
     /// An MCP startup the driver must run, when the build deferred it so the
@@ -283,6 +321,12 @@ impl Session {
     /// so `/new-session` and `/resume` re-point it instead of leaving recall
     /// pinned to the first session of the run.
     pub fn set_current_session(&self, id: Option<String>) {
+        // Image storage follows the same session for the same reason: a resumed
+        // attachment must land in the directory its journal will read.
+        self.attachments.set_session(
+            id.as_deref()
+                .and_then(|id| crate::session::SessionId::parse(id).ok()),
+        );
         *self
             .current_session
             .lock()
@@ -360,25 +404,49 @@ impl Session {
 
     /// Swap the provider credentials at a turn boundary.
     ///
-    /// The provider and the compaction client are rebuilt together so neither
-    /// keeps the previous key, and the catalog returns to `Pending` because the
-    /// new credential may see a different model list.
-    pub fn set_credentials(&mut self, api_key: Option<String>) -> Result<(), BuildError> {
-        let has_credentials = api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
-        let provider: Arc<dyn Provider> = Arc::new(OpenRouterClient::from_optional_api_key(
-            api_key,
-            self.base_url.clone(),
-        )?);
+    /// Both clients are rebuilt together so neither keeps a stale key, the
+    /// compaction client follows them, and the catalog returns to `Pending`
+    /// because the new credentials may see a different model list.
+    pub fn set_credentials(
+        &mut self,
+        openrouter_api_key: Option<String>,
+        opencode_api_key: Option<String>,
+    ) -> Result<(), BuildError> {
+        let routing = self.routing.as_ref().ok_or_else(|| {
+            BuildError::InvalidConfig("this session has no provider to authorize".to_owned())
+        })?;
 
-        self.agent.set_provider(Arc::clone(&provider));
+        routing.set_credentials(openrouter_api_key, opencode_api_key)?;
+
+        let has_credentials = routing.has_credentials();
+
+        // The provider handle is the same selector object: it reads the routing
+        // façade through its `Arc`, so a credential change is visible at once.
         self.agent
-            .set_compactor(Arc::new(ModelCompactor::new(Arc::clone(&provider))));
-        self.provider = provider;
+            .set_compactor(self.compactor_for(Arc::clone(&self.provider)));
         self.model_catalog.clear();
+        self.selected_route = None;
+        self.set_route(None);
         self.catalog = CatalogState::Pending;
         self.has_credentials = has_credentials;
 
         Ok(())
+    }
+
+    /// The compaction client for a provider, sharing the conversation id.
+    fn compactor_for(&self, provider: Arc<dyn Provider>) -> Arc<ModelCompactor> {
+        let compactor = Arc::new(ModelCompactor::new(provider));
+
+        compactor.set_session_id(self.session_id());
+
+        compactor
+    }
+
+    /// The conversation later records go to.
+    fn session_id(&self) -> Option<String> {
+        self.journal
+            .as_ref()
+            .map(|journal| journal.id().to_string())
     }
 
     /// Record a catalog result and refresh the current model's profile.
@@ -387,11 +455,11 @@ impl Session {
     /// it and continue with the fallback profile.
     pub fn apply_catalog(
         &mut self,
-        result: Result<Vec<ModelInfo>, String>,
+        result: Result<Catalog, String>,
     ) -> Result<Option<String>, String> {
         match result {
-            Ok(models) => {
-                self.model_catalog = models;
+            Ok(catalog) => {
+                self.model_catalog = catalog.models;
                 self.catalog = CatalogState::Loaded;
             }
             Err(_) => {
@@ -401,8 +469,39 @@ impl Session {
         }
 
         let model = self.agent.model().to_owned();
+        let route = self.selected_route;
 
-        self.select_model(&model)
+        // The route survives a catalog refresh while the id still exists, so a
+        // duplicated id does not silently jump providers.
+        self.pin_route(&model, route);
+
+        self.select_resolved(&model, route)
+    }
+
+    /// Record the route the next request belongs to.
+    fn set_route(&mut self, route: Option<Route>) {
+        self.selected_route = route;
+        *self
+            .route_cell
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = route;
+    }
+
+    /// Record which provider the selected model came from.
+    fn pin_route(&mut self, model: &str, route: Option<Route>) {
+        self.selected_route = match route {
+            Some(route) => Some(route),
+            None => self.model_route(model),
+        };
+    }
+
+    /// The provider a catalog id belongs to, as the last fetch saw it.
+    fn model_route(&self, model: &str) -> Option<Route> {
+        self.model_catalog
+            .iter()
+            .find(|info| info.id == model)
+            .and_then(|info| info.provider.as_deref())
+            .and_then(Route::from_id)
     }
 
     /// Await catalog discovery once, honoring the metadata deadline.
@@ -410,7 +509,7 @@ impl Session {
     /// `Ok(Some(message))` means the catalog loaded but the active model could
     /// not be matched; the profile still uses the configured fallback.
     pub async fn load_catalog(&mut self) -> Result<Option<String>, String> {
-        let result = fetch_catalog(Arc::clone(&self.provider), self.catalog_timeout).await;
+        let result = fetch_session_catalog(self).await;
         let failure = result.as_ref().err().cloned();
         let profile = self.apply_catalog(result);
 
@@ -420,20 +519,83 @@ impl Session {
         }
     }
 
+    /// The provider the next request is routed to.
+    pub fn selected_route(&self) -> Option<Route> {
+        self.selected_route
+    }
+
     /// Switch models using the catalog metadata for the new model.
     ///
     /// The output budget and image capability belong to the selected model and
     /// are recomputed here; a context/output limit from the previous model must
     /// never leak into the next request.
+    ///
+    /// An ambiguous id (one both providers serve) resolves to the routing
+    /// index's first entry; the picker uses [`Self::select_model_from_row`] to
+    /// pin the provider the user actually chose.
     pub fn select_model(&mut self, model: &str) -> Result<Option<String>, String> {
-        let requested = model.trim();
+        let requested = model.trim().to_owned();
 
         if requested.is_empty() {
             return Err("the model id must not be empty".to_owned());
         }
 
-        let resolution = resolve_catalog_model(&self.model_catalog, requested);
-        let info = resolution.model();
+        let route = self.model_route(&requested);
+
+        self.select_resolved(&requested, route)
+    }
+
+    /// Switch models with the provider the user picked in the catalog.
+    ///
+    /// The route is pinned even when the id also exists in the other catalog,
+    /// so a Go subscriber reaches the Go copy of a duplicated model.
+    pub fn select_model_from_row(
+        &mut self,
+        model: &str,
+        provider: Option<&str>,
+    ) -> Result<(), String> {
+        let requested = model.trim().to_owned();
+
+        if requested.is_empty() {
+            return Err("the model id must not be empty".to_owned());
+        }
+
+        let route = provider
+            .and_then(Route::from_id)
+            .or_else(|| self.model_route(&requested));
+
+        let warning = self.select_resolved(&requested, route)?;
+
+        self.selection_warning = warning;
+
+        Ok(())
+    }
+
+    /// The warning the last [`Self::select_model_from_row`] produced.
+    pub fn take_selection_warning(&mut self) -> Option<String> {
+        self.selection_warning.take()
+    }
+
+    /// The shared body of every model switch.
+    fn select_resolved(
+        &mut self,
+        requested: &str,
+        route: Option<Route>,
+    ) -> Result<Option<String>, String> {
+        // A pinned route selects that provider's copy of a duplicated id.
+        let resolution = match route {
+            Some(route) => resolve_catalog_model_for(&self.model_catalog, requested, route),
+            None => resolve_catalog_model(&self.model_catalog, requested),
+        };
+        let info = resolution.model().cloned();
+        let info = info.as_ref();
+        let selected_route = route.or_else(|| {
+            info.and_then(|info| info.provider.as_deref())
+                .and_then(Route::from_id)
+        });
+
+        self.set_route(selected_route);
+
         let selected_model = info
             .map(|info| info.id.clone())
             .unwrap_or_else(|| requested.to_owned());
@@ -668,19 +830,26 @@ async fn build_with(
     defer_mcp: bool,
 ) -> Result<Session, BuildError> {
     let model = model.or_else(|| settings.model.clone()).unwrap_or_default();
-    let has_credentials = settings
-        .api_key
-        .as_deref()
-        .is_some_and(|key| !key.trim().is_empty());
+    let default_route = Route::from_id(&settings.provider_kind).unwrap_or(Route::OpenRouter);
+    // One façade over both catalogs: a model id decides where its request goes.
+    let routing = Arc::new(RoutingProvider::new(
+        settings.openrouter_api_key.clone(),
+        settings.base_url.clone(),
+        settings.opencode_go_api_key.clone(),
+        crate::config::DEFAULT_OPENCODE_GO_BASE_URL,
+        default_route,
+    )?);
+    let has_credentials = routing.has_credentials();
 
     if require_credentials && !has_credentials {
         return Err(t8ful_core::ProviderError::MissingCredentials.into());
     }
 
-    let provider: Arc<dyn Provider> = Arc::new(OpenRouterClient::from_optional_api_key(
-        settings.api_key.clone(),
-        settings.base_url.clone(),
-    )?);
+    let route_cell: RouteCell = Arc::new(std::sync::Mutex::new(None));
+    let provider: Arc<dyn Provider> = Arc::new(RouteSelector::new(
+        Arc::clone(&routing),
+        Arc::clone(&route_cell),
+    ));
 
     // Start with configured values. Metadata arrives after the first frame; no
     // chat turn is allowed to start until discovery settles.
@@ -696,7 +865,25 @@ async fn build_with(
     let processes = Arc::new(ManagedProcesses::new(settings.max_output_bytes));
     let skills = Arc::new(SkillCatalog::discover(&settings.skill_roots));
     let skill_library: Arc<dyn t8ful_tools::skill::SkillLibrary> = skills.clone();
-    let mut tools: ToolRegistry = builtin_registry(Arc::clone(&processes), skill_library);
+    // Tool-returned images land in the live session's attachment directory. The
+    // entry point already resolved the state paths, so they are reused rather
+    // than resolved from the environment a second time. The store reads the
+    // session id at store time, so `/new` and `/resume` move it along with
+    // `current_session`.
+    let attachments = Arc::new(match &agents_env {
+        Some(env) => crate::attachments::SessionAttachments::new(env.paths.clone()),
+        None => crate::attachments::SessionAttachments::unbound(),
+    });
+    attachments.set_session(
+        journal
+            .as_ref()
+            .and_then(|journal| crate::session::SessionId::parse(journal.id().as_str()).ok()),
+    );
+    let mut tools: ToolRegistry = builtin_registry(
+        Arc::clone(&processes),
+        skill_library,
+        Arc::clone(&attachments) as Arc<dyn t8ful_tools::AttachmentStore>,
+    );
     // The cell exists even when recall itself is withheld: the driver keeps it
     // pointing at the live session regardless of which tools are registered.
     let current_session = Arc::new(std::sync::Mutex::new(
@@ -760,6 +947,10 @@ async fn build_with(
     config.context_limit = Some(context_limit);
     config.supports_images = supports_images;
     config.agent_id = "root".to_owned();
+    config.session_id = journal
+        .as_ref()
+        .map(|journal| journal.id().to_string())
+        .unwrap_or_default();
     config.request_namespace = format!(
         "{}-{}",
         journal
@@ -941,8 +1132,9 @@ async fn build_with(
         agent.set_journal(Arc::clone(journal) as Arc<dyn t8ful_core::journal::AgentJournal>);
     }
 
-    let compactor: Arc<dyn ContextCompactor> = Arc::new(ModelCompactor::new(Arc::clone(&provider)));
+    let compactor = Arc::new(ModelCompactor::new(Arc::clone(&provider)));
 
+    compactor.set_session_id(journal.as_ref().map(|journal| journal.id().to_string()));
     agent.set_compactor(compactor);
 
     let mut session = Session {
@@ -969,12 +1161,16 @@ async fn build_with(
         context_limit_override: settings.context_limit,
         context_limit_fallback: settings.context_limit_fallback,
         provider,
+        routing: Some(routing),
         catalog: CatalogState::Pending,
         catalog_timeout: settings.catalog_timeout,
-        base_url: settings.base_url.clone(),
+        selected_route: None,
+        route_cell,
+        selection_warning: None,
         agents,
         tasks,
         current_session,
+        attachments,
     };
 
     // A headless build has no frame to paint, so it waits for the servers here
@@ -1000,14 +1196,55 @@ async fn build_with(
 pub(crate) async fn fetch_catalog(
     provider: Arc<dyn Provider>,
     timeout: Duration,
-) -> Result<Vec<ModelInfo>, String> {
+) -> Result<Catalog, String> {
     match tokio::time::timeout(timeout, provider.list_models()).await {
-        Ok(Ok(models)) => Ok(models),
+        Ok(Ok(models)) => Ok(Catalog {
+            models,
+            warnings: Vec::new(),
+        }),
         Ok(Err(error)) => Err(format!("could not load model metadata: {error}")),
         Err(_) => Err(format!(
             "model catalog request timed out after {} ms",
             timeout.as_millis()
         )),
+    }
+}
+
+/// Decide whether a merged catalog is usable.
+///
+/// One provider's failure is a warning and the other provider's models still
+/// load; nothing at all is a failure, so every frontend can show the
+/// unavailable state instead of an empty picker that looks like a real result.
+pub(crate) fn settle_catalog(catalog: Catalog) -> Result<Catalog, String> {
+    if !catalog.models.is_empty() || catalog.warnings.is_empty() {
+        return Ok(catalog);
+    }
+
+    Err(catalog.warnings.join("; "))
+}
+
+/// Fetch the merged catalog, keeping the per-provider warnings.
+///
+/// [`fetch_catalog`] goes through the core provider trait, which has nowhere to
+/// put a partial failure; a session built around the routing façade fetches
+/// through it directly so one provider's outage stays a warning instead of
+/// discarding the other provider's models.
+pub(crate) async fn fetch_session_catalog(session: &Session) -> Result<Catalog, String> {
+    let timeout = session.catalog_timeout;
+
+    match &session.routing {
+        Some(routing) => {
+            let routing = Arc::clone(routing);
+
+            match tokio::time::timeout(timeout, routing.catalog(timeout)).await {
+                Ok(catalog) => settle_catalog(catalog),
+                Err(_) => Err(format!(
+                    "model catalog request timed out after {} ms",
+                    timeout.as_millis()
+                )),
+            }
+        }
+        None => fetch_catalog(Arc::clone(&session.provider), timeout).await,
     }
 }
 
@@ -1268,6 +1505,7 @@ mod tests {
         DEFAULT_BASE_URL, DEFAULT_CONTEXT_LIMIT_FALLBACK, Settings, SkillRoot, SkillSource,
     };
     use crate::instructions::Instructions;
+    use crate::providers::{Route, RoutingProvider};
     use crate::root::{RootInfo, RootSource};
     use crate::skills::{DiscoveredSkill, SkillCatalog, test_catalog};
 
@@ -1315,7 +1553,7 @@ mod tests {
         .expect("session")
     }
 
-    async fn built_session(settings: &Settings) -> Session {
+    pub(super) async fn built_session(settings: &Settings) -> Session {
         built_session_for(settings, "vendor/model").await
     }
 
@@ -1342,6 +1580,7 @@ mod tests {
         let mut registry = t8ful_tools::builtin_registry(
             Arc::new(t8ful_tools::ManagedProcesses::new(1024)),
             Arc::new(t8ful_tools::NoSkills),
+            Arc::new(t8ful_tools::NoAttachments),
         );
 
         registry.register(t8ful_tools::RecallTool::new(
@@ -1352,6 +1591,14 @@ mod tests {
         registry
     }
 
+    /// A catalog holding exactly these models.
+    fn catalog_of(models: Vec<ModelInfo>) -> super::Catalog {
+        super::Catalog {
+            models,
+            warnings: Vec::new(),
+        }
+    }
+
     fn model_info() -> ModelInfo {
         model_info_with_id("vendor/model")
     }
@@ -1359,6 +1606,7 @@ mod tests {
     fn model_info_with_id(id: &str) -> ModelInfo {
         ModelInfo {
             id: id.to_owned(),
+            provider: None,
             name: Some("Model".to_owned()),
             context_length: Some(64_000),
             max_output_tokens: Some(4_096),
@@ -1370,7 +1618,7 @@ mod tests {
         }
     }
 
-    fn settings() -> Settings {
+    pub(super) fn settings() -> Settings {
         Settings {
             agents: crate::config::AgentSettings::default(),
             root: RootInfo {
@@ -1380,7 +1628,9 @@ mod tests {
             launch_dir: PathBuf::from("/work/project/sub"),
             model: Some("vendor/model".to_owned()),
             base_url: DEFAULT_BASE_URL.to_owned(),
-            api_key: Some("key".to_owned()),
+            openrouter_api_key: Some("key".to_owned()),
+            opencode_go_api_key: None,
+            provider_kind: crate::config::DEFAULT_PROVIDER.to_owned(),
             mode: t8ful_core::policy::Mode::Coding,
             reasoning_effort: ReasoningEffort::Default,
             reasoning_models: std::collections::BTreeMap::new(),
@@ -1604,6 +1854,7 @@ mod tests {
         let registry = t8ful_tools::builtin_registry(
             std::sync::Arc::new(t8ful_tools::ManagedProcesses::new(1024)),
             std::sync::Arc::new(t8ful_tools::NoSkills),
+            std::sync::Arc::new(t8ful_tools::NoAttachments),
         );
         let edit = registry.get("edit_file").expect("edit_file").spec();
         let properties = &edit.parameters["properties"];
@@ -1847,7 +2098,7 @@ mod tests {
         let mut session = built_session(&settings()).await;
 
         session
-            .apply_catalog(Ok(vec![model_info()]))
+            .apply_catalog(Ok(catalog_of(vec![model_info()])))
             .expect("catalog");
 
         let config = session.agent.config();
@@ -1909,7 +2160,9 @@ mod tests {
 
         info.supports_reasoning = Some(false);
 
-        session.apply_catalog(Ok(vec![info])).expect("catalog");
+        session
+            .apply_catalog(Ok(catalog_of(vec![info])))
+            .expect("catalog");
 
         let levels = session.agent.reasoning_profile().levels();
 
@@ -1939,7 +2192,7 @@ mod tests {
         info.supports_reasoning = Some(false);
 
         let warning = session
-            .apply_catalog(Ok(vec![info]))
+            .apply_catalog(Ok(catalog_of(vec![info])))
             .expect("catalog")
             .expect("warning");
 
@@ -1969,14 +2222,14 @@ mod tests {
     async fn the_interactive_build_starts_without_a_key() {
         let mut settings = settings();
 
-        settings.api_key = None;
+        settings.openrouter_api_key = None;
 
         let session = build_interactive(&settings).await;
 
         assert!(!session.has_credentials);
         assert!(session.catalog_pending());
 
-        settings.api_key = Some("key".to_owned());
+        settings.openrouter_api_key = Some("key".to_owned());
 
         let session = build_interactive(&settings).await;
 
@@ -1987,7 +2240,7 @@ mod tests {
     async fn the_headless_build_requires_a_key() {
         let mut settings = settings();
 
-        settings.api_key = None;
+        settings.openrouter_api_key = None;
 
         let result = build(
             &settings,
@@ -2016,29 +2269,42 @@ mod tests {
         let mut session = built_session(&settings()).await;
 
         session
-            .apply_catalog(Ok(vec![model_info()]))
+            .apply_catalog(Ok(catalog_of(vec![model_info()])))
             .expect("catalog");
         assert!(!session.catalog_pending());
 
         session
-            .set_credentials(Some("another-key".to_owned()))
+            .set_credentials(Some("another-key".to_owned()), None)
             .expect("credentials");
 
         assert!(session.has_credentials);
         assert!(session.catalog_pending());
         assert!(session.model_catalog.is_empty());
 
-        session.set_credentials(None).expect("credentials");
+        session.set_credentials(None, None).expect("credentials");
 
         assert!(!session.has_credentials);
         assert!(session.catalog_pending());
+    }
+
+    /// A session carries one provider handle and one routing façade, and
+    /// `load_catalog` picks the façade when it has one. A test that swaps only
+    /// the handle would reach the real network through the façade, so both are
+    /// replaced here with a provider that never answers.
+    fn session_without_a_provider(session: &mut Session) {
+        session.provider = Arc::new(PendingProvider);
+        session.routing = Some(Arc::new(RoutingProvider::from_clients(
+            Some(Arc::new(PendingProvider)),
+            None,
+            Route::OpenRouter,
+        )));
     }
 
     #[tokio::test]
     async fn load_catalog_maps_the_metadata_deadline_to_an_error() {
         let mut session = built_session(&settings()).await;
 
-        session.provider = Arc::new(PendingProvider);
+        session_without_a_provider(&mut session);
         session.catalog_timeout = Duration::from_millis(10);
 
         let error = session.load_catalog().await.expect_err("timeout");
@@ -2050,12 +2316,13 @@ mod tests {
     #[tokio::test]
     async fn fetch_catalog_returns_provider_models() {
         let provider: Arc<dyn Provider> = Arc::new(StaticProvider(vec![model_info()]));
-        let models = fetch_catalog(provider, Duration::from_secs(1))
+        let catalog = fetch_catalog(provider, Duration::from_secs(1))
             .await
             .expect("catalog");
 
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "vendor/model");
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].id, "vendor/model");
+        assert!(catalog.warnings.is_empty());
     }
 
     #[test]
@@ -2097,7 +2364,7 @@ mod tests {
         info.max_output_tokens = Some(32_768);
 
         let warning = session
-            .apply_catalog(Ok(vec![info]))
+            .apply_catalog(Ok(catalog_of(vec![info])))
             .expect("catalog applies");
         println!("WARNING: {warning:?}");
 
@@ -2115,7 +2382,7 @@ mod tests {
 
         let mut session = built_session_for(&settings, "missing/other-model").await;
         let warning = session
-            .apply_catalog(Ok(vec![model_info()]))
+            .apply_catalog(Ok(catalog_of(vec![model_info()])))
             .expect("fallback profile")
             .expect("warning");
 
@@ -2141,7 +2408,7 @@ mod tests {
         let mut session = built_session(&settings).await;
 
         let warning = session
-            .apply_catalog(Ok(vec![model_info()]))
+            .apply_catalog(Ok(catalog_of(vec![model_info()])))
             .expect("catalog applies");
 
         assert!(warning.is_none());
@@ -2287,5 +2554,131 @@ mod tests {
             "a stopped server's tools stayed registered: {:?}",
             session.agent.tool_names()
         );
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use t8ful_core::provider::ModelInfo;
+
+    use super::{Catalog, Route, Session};
+
+    fn model(id: &str, provider: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.to_owned(),
+            provider: Some(provider.to_owned()),
+            name: None,
+            context_length: Some(64_000),
+            max_output_tokens: Some(4_096),
+            supports_images: None,
+            supports_reasoning: None,
+            reasoning: None,
+            prompt_price: None,
+            completion_price: None,
+        }
+    }
+
+    fn catalog(models: Vec<ModelInfo>) -> Catalog {
+        Catalog {
+            models,
+            warnings: Vec::new(),
+        }
+    }
+
+    async fn session() -> Session {
+        super::tests::built_session(&super::tests::settings()).await
+    }
+
+    #[tokio::test]
+    async fn a_picked_row_pins_its_provider() {
+        let mut session = session().await;
+
+        session
+            .apply_catalog(Ok(catalog(vec![
+                model("deepseek-v4.1-flash", "openrouter"),
+                model("deepseek-v4.1-flash", "opencode-go"),
+            ])))
+            .expect("catalog");
+
+        // Both rows exist, and each selection pins the provider it came from.
+        session
+            .select_model_from_row("deepseek-v4.1-flash", Some("opencode-go"))
+            .expect("go row");
+
+        assert_eq!(session.selected_route(), Some(Route::OpencodeGo));
+        assert_eq!(*session.route_cell.lock().unwrap(), Some(Route::OpencodeGo));
+
+        session
+            .select_model_from_row("deepseek-v4.1-flash", Some("openrouter"))
+            .expect("openrouter row");
+
+        assert_eq!(session.selected_route(), Some(Route::OpenRouter));
+    }
+
+    #[tokio::test]
+    async fn a_provider_scoped_resolution_prefers_that_providers_copy() {
+        let mut session = session().await;
+
+        session
+            .apply_catalog(Ok(catalog(vec![
+                model("kimi-k3", "openrouter"),
+                model("kimi-k3", "opencode-go"),
+            ])))
+            .expect("catalog");
+
+        // Without a pin the first catalog row wins, which is OpenRouter.
+        session.select_model("kimi-k3").expect("select");
+
+        assert_eq!(session.selected_route(), Some(Route::OpenRouter));
+
+        // A pinned row reaches the Go copy even though the id matches both.
+        session
+            .select_model_from_row("kimi-k3", Some("opencode-go"))
+            .expect("select");
+
+        assert_eq!(session.selected_route(), Some(Route::OpencodeGo));
+        assert!(session.take_selection_warning().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unselected_id_leaves_the_route_unpinned() {
+        let mut session = session().await;
+
+        session
+            .apply_catalog(Ok(catalog(vec![model("kimi-k3", "opencode-go")])))
+            .expect("catalog");
+
+        let warning = session.select_model("hand/typed").expect("select");
+
+        assert_eq!(session.selected_route(), None);
+        assert!(
+            warning.is_some_and(|warning| warning.contains("was not found")),
+            "an unknown id still warns"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_catalog_refresh_keeps_the_pinned_provider() {
+        let mut session = session().await;
+
+        session
+            .apply_catalog(Ok(catalog(vec![
+                model("kimi-k3", "openrouter"),
+                model("kimi-k3", "opencode-go"),
+            ])))
+            .expect("catalog");
+        session
+            .select_model_from_row("kimi-k3", Some("opencode-go"))
+            .expect("select");
+
+        // A refresh re-runs the selection; the pinned provider must survive it.
+        session
+            .apply_catalog(Ok(catalog(vec![
+                model("kimi-k3", "openrouter"),
+                model("kimi-k3", "opencode-go"),
+            ])))
+            .expect("catalog");
+
+        assert_eq!(session.selected_route(), Some(Route::OpencodeGo));
     }
 }

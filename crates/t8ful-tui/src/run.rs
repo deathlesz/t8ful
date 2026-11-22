@@ -60,7 +60,7 @@ pub struct TuiConfig {
     pub usage: crate::state::UsageTotals,
     pub show_reasoning: bool,
     pub reasoning_effort: ReasoningEffort,
-    pub models: Vec<String>,
+    pub models: Vec<crate::bridge::ModelRow>,
     pub max_image_encoded_bytes: usize,
     pub mouse: bool,
     /// Ring the terminal bell and raise a desktop notification.
@@ -1527,17 +1527,31 @@ fn run_command(state: &mut AppState, commands: &mpsc::UnboundedSender<TuiCommand
             }
         }
         "/login" => {
-            if argument.is_empty() || argument.eq_ignore_ascii_case("openrouter") {
+            if argument.is_empty() {
                 state.open_login("openrouter");
+            } else if crate::state::is_known_provider(argument) {
+                state.open_login(crate::state::normalize_provider(argument));
             } else {
                 state.set_status(format!(
-                    "unknown provider {argument}; use /login openrouter"
+                    "unknown provider {argument}; use /login openrouter or /login opencode-go"
                 ));
             }
         }
         "/logout" => {
-            let _ = commands.send(TuiCommand::Logout);
-            state.set_status("logging out…".to_owned());
+            if argument.is_empty() || crate::state::is_known_provider(argument) {
+                let provider = if argument.is_empty() {
+                    "openrouter".to_owned()
+                } else {
+                    crate::state::normalize_provider(argument).to_owned()
+                };
+
+                let _ = commands.send(TuiCommand::Logout { provider });
+                state.set_status("logging out…".to_owned());
+            } else {
+                state.set_status(format!(
+                    "unknown provider {argument}; use /logout openrouter or /logout opencode-go"
+                ));
+            }
         }
         "/model" => {
             if argument.is_empty() {
@@ -1553,7 +1567,12 @@ fn run_command(state: &mut AppState, commands: &mpsc::UnboundedSender<TuiCommand
                     }
                 }
             } else {
-                let _ = commands.send(TuiCommand::SelectModel(argument.to_owned()));
+                // A typed id is not pinned to a provider: the driver resolves it
+                // against the catalog, and falls back to the default provider.
+                let _ = commands.send(TuiCommand::SelectModel(crate::bridge::ModelRow::new(
+                    argument.to_owned(),
+                    None,
+                )));
                 state.set_status("model change queued for the next turn boundary".to_owned());
             }
         }
@@ -1809,6 +1828,11 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// A catalog row with no provider, as a single-provider build produces.
+    fn row(id: &str) -> crate::bridge::ModelRow {
+        crate::bridge::ModelRow::new(id, None)
+    }
+
     fn session(id: &str, title: &str, last_message_at: u64) -> SessionSummary {
         SessionSummary {
             id: id.to_owned(),
@@ -1903,7 +1927,7 @@ mod tests {
         assert_eq!(state.header.model, "vendor/model");
         assert!(matches!(
             received.try_recv(),
-            Ok(TuiCommand::SelectModel(model)) if model == "vendor/other"
+            Ok(TuiCommand::SelectModel(model)) if model.id == "vendor/other"
         ));
     }
 
@@ -2173,7 +2197,7 @@ mod tests {
 
         // The same bindings edit the model and session picker filters.
         state.should_quit = false;
-        state.models = vec!["vendor/large".to_owned()];
+        state.models = vec![row("vendor/large")];
         run_command(&mut state, &commands, "/model");
         type_text(&mut state, &commands, "lrg");
 
@@ -2510,6 +2534,7 @@ mod tests {
                                 content: String::new(),
                                 truncated: false,
                                 process_id: None,
+                                images: Vec::new(),
                             },
                         ] {
                             absorb_event(&mut state, &mut attention, event);
@@ -2602,7 +2627,7 @@ mod tests {
 
         assert!(matches!(
             received.try_recv(),
-            Ok(TuiCommand::SelectModel(model)) if model == "vendor/other"
+            Ok(TuiCommand::SelectModel(model)) if model.id == "vendor/other"
         ));
     }
 
@@ -2838,7 +2863,10 @@ mod tests {
 
         run_command(&mut state, &commands, "/logout");
 
-        assert!(matches!(received.try_recv(), Ok(TuiCommand::Logout)));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(TuiCommand::Logout { provider }) if provider == "openrouter"
+        ));
     }
 
     #[test]
@@ -3266,11 +3294,7 @@ mod tests {
         let mut state = state();
         let (commands, mut received) = mpsc::unbounded_channel();
 
-        state.models = vec![
-            "vendor/large".to_owned(),
-            "vendor/small".to_owned(),
-            "other/model".to_owned(),
-        ];
+        state.models = vec![row("vendor/large"), row("vendor/small"), row("other/model")];
         run_command(&mut state, &commands, "/model");
         assert_eq!(state.picker, Some(0));
 
@@ -3282,16 +3306,16 @@ mod tests {
 
         assert!(matches!(
             received.try_recv(),
-            Ok(TuiCommand::SelectModel(model)) if model == "vendor/large"
+            Ok(TuiCommand::SelectModel(model)) if model.id == "vendor/large"
         ));
         assert!(state.picker.is_none());
         assert_eq!(state.picker_filter(), "");
 
         // Navigation never leaves the filtered rows.
         state.models = vec![
-            "vendor/large".to_owned(),
-            "vendor/large-mini".to_owned(),
-            "vendor/small".to_owned(),
+            row("vendor/large"),
+            row("vendor/large-mini"),
+            row("vendor/small"),
         ];
         run_command(&mut state, &commands, "/model");
         type_text(&mut state, &commands, "large");
@@ -3310,7 +3334,7 @@ mod tests {
         let mut state = state();
         let (commands, _received) = mpsc::unbounded_channel();
 
-        state.models = vec!["vendor/large".to_owned()];
+        state.models = vec![row("vendor/large")];
         run_command(&mut state, &commands, "/model");
         type_text(&mut state, &commands, "lar");
 
@@ -3323,21 +3347,23 @@ mod tests {
         assert_eq!(state.status, "model picker closed");
 
         // A refreshed catalog keeps the selected row when its filter matches.
-        state.models = vec!["vendor/large".to_owned(), "vendor/small".to_owned()];
+        state.models = vec![row("vendor/large"), row("vendor/small")];
         run_command(&mut state, &commands, "/model");
         type_text(&mut state, &commands, "small");
-        assert_eq!(state.selected_model().as_deref(), Some("vendor/small"));
+        assert_eq!(
+            state.selected_model().map(|model| model.id),
+            Some("vendor/small".to_owned())
+        );
 
         state.apply_catalog(crate::bridge::CatalogSnapshot::Loaded {
-            models: vec![
-                "vendor/small".to_owned(),
-                "vendor/large".to_owned(),
-                "vendor/tiny".to_owned(),
-            ],
+            models: vec![row("vendor/small"), row("vendor/large"), row("vendor/tiny")],
         });
 
         assert_eq!(state.picker_filter(), "small");
-        assert_eq!(state.selected_model().as_deref(), Some("vendor/small"));
+        assert_eq!(
+            state.selected_model().map(|model| model.id),
+            Some("vendor/small".to_owned())
+        );
     }
 
     #[derive(Default)]

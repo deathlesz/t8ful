@@ -8,8 +8,6 @@ use clap::Parser;
 
 use t8ful_core::agent::TurnFinish;
 use t8ful_core::message::Message;
-use t8ful_core::provider::Provider;
-use t8ful_openrouter::OpenRouterClient;
 use t8ful_tui::{Header, TuiConfig, UsageTotals};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -29,6 +27,7 @@ use crate::trust::ProjectTrust;
 use crate::usage::UsageLedger;
 use t8ful_core::question::{Question, QuestionOption, QuestionRequest};
 
+mod attachments;
 mod auth;
 mod child_journal;
 mod children;
@@ -42,6 +41,7 @@ mod files;
 mod headless;
 mod images;
 mod instructions;
+mod providers;
 mod recall;
 mod root;
 mod session;
@@ -322,11 +322,27 @@ fn state_paths() -> StatePaths {
 
 /// Apply stored credentials to the resolved settings.
 ///
-/// `OPENROUTER_API_KEY` always wins; `auth.json` only fills in when the
-/// variable is absent. A malformed file is a startup error, not a silent
-/// fallback, because the user asked for that key to be used.
-fn apply_auth(settings: &mut Settings, paths: &StatePaths) -> Result<auth::AuthSource, i32> {
-    let resolved = match auth::resolve(paths, settings.api_key.as_deref()) {
+/// Each provider's environment variable always wins; `auth.json` only fills in
+/// when that variable is absent. A malformed file is a startup error, not a
+/// silent fallback, because the user asked for those keys to be used.
+fn apply_auth(settings: &mut Settings, paths: &StatePaths) -> Result<AuthSources, i32> {
+    let openrouter = match auth::resolve(
+        paths,
+        auth::OPENROUTER,
+        settings.openrouter_api_key.as_deref(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("t8ful: {error}");
+
+            return Err(exit::FAILURE);
+        }
+    };
+    let opencode = match auth::resolve(
+        paths,
+        auth::OPENCODE_GO,
+        settings.opencode_go_api_key.as_deref(),
+    ) {
         Ok(resolved) => resolved,
         Err(error) => {
             eprintln!("t8ful: {error}");
@@ -335,9 +351,37 @@ fn apply_auth(settings: &mut Settings, paths: &StatePaths) -> Result<auth::AuthS
         }
     };
 
-    settings.api_key = resolved.key.clone();
+    settings.openrouter_api_key = openrouter.key.clone();
+    settings.opencode_go_api_key = opencode.key.clone();
 
-    Ok(resolved.source)
+    Ok(AuthSources {
+        openrouter: openrouter.source,
+        opencode_go: opencode.source,
+    })
+}
+
+/// Where each provider's active credential came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AuthSources {
+    pub(crate) openrouter: auth::AuthSource,
+    pub(crate) opencode_go: auth::AuthSource,
+}
+
+impl AuthSources {
+    fn snapshot(self) -> t8ful_tui::AuthSnapshot {
+        fn kind(source: auth::AuthSource) -> t8ful_tui::AuthKind {
+            match source {
+                auth::AuthSource::Environment => t8ful_tui::AuthKind::Environment,
+                auth::AuthSource::Stored => t8ful_tui::AuthKind::Stored,
+                auth::AuthSource::Missing => t8ful_tui::AuthKind::Missing,
+            }
+        }
+
+        t8ful_tui::AuthSnapshot {
+            openrouter: kind(self.openrouter),
+            opencode_go: kind(self.opencode_go),
+        }
+    }
 }
 
 fn ledger(paths: &StatePaths) -> Arc<UsageLedger> {
@@ -400,6 +444,7 @@ async fn prepare_journal(
             settings.model.clone(),
             settings.mode,
             settings.reasoning_effort,
+            None,
             Some(ledger),
         )
         .map_err(|error| {
@@ -469,7 +514,7 @@ async fn run_tui(cli: &Cli) -> i32 {
     }
 
     let recall = recall(&paths);
-    let auth_source = match apply_auth(&mut settings, &paths) {
+    let auth_sources = match apply_auth(&mut settings, &paths) {
         Ok(source) => source,
         Err(code) => return code,
     };
@@ -553,7 +598,12 @@ async fn run_tui(cli: &Cli) -> i32 {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         branch: root::branch(&settings.launch_dir),
     };
-    let models = settings.model.clone().into_iter().collect::<Vec<_>>();
+    let models = settings
+        .model
+        .clone()
+        .into_iter()
+        .map(|id| t8ful_tui::ModelRow::new(id, None))
+        .collect::<Vec<_>>();
 
     let init = driver::DriverInit {
         paths,
@@ -567,6 +617,9 @@ async fn run_tui(cli: &Cli) -> i32 {
         notify_on_exit: settings.notify_on_exit,
         emitter,
         event_rx,
+        openrouter_api_key: settings.openrouter_api_key.clone(),
+        opencode_go_api_key: settings.opencode_go_api_key.clone(),
+        sources: auth_sources,
     };
     let reasoning_effort = session.agent.reasoning_effort();
     // The journal's records are the footer's starting point; the driver only
@@ -575,13 +628,7 @@ async fn run_tui(cli: &Cli) -> i32 {
         .as_ref()
         .map(|loaded| UsageTotals::from_records(&loaded.usage))
         .unwrap_or_default();
-    let auth_snapshot = match auth_source {
-        auth::AuthSource::Environment => t8ful_tui::AuthSnapshot::Environment,
-        auth::AuthSource::Stored => t8ful_tui::AuthSnapshot::Stored,
-        auth::AuthSource::Missing => t8ful_tui::AuthSnapshot::Missing,
-    };
-
-    let _ = endpoints.auth_tx.send(auth_snapshot);
+    let _ = endpoints.auth_tx.send(auth_sources.snapshot());
 
     let driver = tokio::spawn(driver::drive(session, endpoints, init));
 
@@ -931,33 +978,50 @@ async fn run_models(cli: &Cli, args: &ModelsArgs) -> i32 {
         return code;
     }
 
-    let provider =
-        match OpenRouterClient::from_api_key(settings.api_key.clone(), settings.base_url.clone()) {
-            Ok(provider) => provider,
-            Err(error) => {
-                eprintln!("t8ful: {error}");
-
-                return exit::FAILURE;
-            }
-        };
-
-    let models = match tokio::time::timeout(settings.catalog_timeout, provider.list_models()).await
-    {
-        Ok(Ok(models)) => models,
-        Ok(Err(error)) => {
+    let default_route =
+        providers::Route::from_id(&settings.provider_kind).unwrap_or(providers::Route::OpenRouter);
+    let routing = match providers::RoutingProvider::new(
+        settings.openrouter_api_key.clone(),
+        settings.base_url.clone(),
+        settings.opencode_go_api_key.clone(),
+        config::DEFAULT_OPENCODE_GO_BASE_URL,
+        default_route,
+    ) {
+        Ok(routing) => routing,
+        Err(error) => {
             eprintln!("t8ful: {error}");
 
             return exit::FAILURE;
         }
-        Err(_) => {
-            eprintln!(
-                "t8ful: model catalog request timed out after {} ms",
-                settings.catalog_timeout.as_millis()
-            );
-
-            return exit::FAILURE;
-        }
     };
+
+    if !routing.has_credentials() {
+        eprintln!("t8ful: {}", t8ful_core::ProviderError::MissingCredentials);
+
+        return exit::FAILURE;
+    }
+
+    let catalog = routing.catalog(settings.catalog_timeout).await;
+
+    // A provider whose catalog failed is reported, but the other one's models
+    // remain usable, so this is not fatal unless nothing at all came back.
+    for warning in &catalog.warnings {
+        eprintln!("t8ful: warning: {warning}");
+    }
+
+    if catalog.models.is_empty() {
+        if let Some(warning) = catalog.warnings.first() {
+            eprintln!("t8ful: {warning}");
+        } else {
+            eprintln!("t8ful: the model catalog is empty");
+        }
+
+        return exit::FAILURE;
+    }
+
+    report_provider_warning(&routing);
+
+    let models = catalog.models;
 
     if args.json {
         let payload = models
@@ -965,6 +1029,7 @@ async fn run_models(cli: &Cli, args: &ModelsArgs) -> i32 {
             .map(|model| {
                 serde_json::json!({
                     "id": model.id,
+                    "provider": model.provider,
                     "name": model.name,
                     "context_length": model.context_length,
                     "max_output_tokens": model.max_output_tokens,
@@ -984,19 +1049,89 @@ async fn run_models(cli: &Cli, args: &ModelsArgs) -> i32 {
             }
         }
     } else {
-        for model in &models {
-            let id = terminal_safe_line(&model.id);
-
-            match &model.name {
-                Some(name) => println!("{id}\t{}", terminal_safe_line(name)),
-                None => println!("{id}"),
-            }
-        }
+        print_model_table(&models);
     }
 
     let _ = std::io::stdout().flush();
 
     exit::SUCCESS
+}
+
+/// Print the merged catalog as aligned columns.
+///
+/// The provider column is what makes a merged list readable: the same id can
+/// appear twice, and only the provider tells the two rows apart.
+fn print_model_table(models: &[t8ful_core::ModelInfo]) {
+    let header = ["ID", "PROVIDER", "NAME"];
+    let mut widths = [header[0].len(), header[1].len(), header[2].len()];
+    let rows = models
+        .iter()
+        .map(|model| {
+            [
+                terminal_safe_line(&model.id),
+                terminal_safe_line(model.provider.as_deref().unwrap_or("-")),
+                model
+                    .name
+                    .as_deref()
+                    .map(terminal_safe_line)
+                    .unwrap_or_default(),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row.iter()) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+
+    println!(
+        "{:<id$}  {:<provider$}  NAME",
+        header[0],
+        header[1],
+        id = widths[0],
+        provider = widths[1]
+    );
+
+    for row in &rows {
+        if row[2].is_empty() {
+            println!(
+                "{:<id$}  {:<provider$}",
+                row[0],
+                row[1],
+                id = widths[0],
+                provider = widths[1]
+            );
+        } else {
+            println!(
+                "{:<id$}  {:<provider$}  {}",
+                row[0],
+                row[1],
+                row[2],
+                id = widths[0],
+                provider = widths[1]
+            );
+        }
+    }
+}
+
+/// Say which provider a run without one of the keys will not reach.
+///
+/// Absent credentials are not an error while the other provider works, but the
+/// omission is worth one line: the user may not know half the catalog is
+/// missing.
+fn report_provider_warning(routing: &providers::RoutingProvider) {
+    for (route, variable) in [
+        (providers::Route::OpenRouter, "OPENROUTER_API_KEY"),
+        (providers::Route::OpencodeGo, "OPENCODE_GO_API_KEY"),
+    ] {
+        if !routing.provider_authenticated(route) {
+            eprintln!(
+                "t8ful: warning: no {variable}; models from {} are not listed",
+                route.id()
+            );
+        }
+    }
 }
 
 fn run_sessions(cli: &Cli, args: &SessionsArgs) -> i32 {

@@ -74,6 +74,7 @@ impl Tool for WriteFileTool {
                 "bytes": bytes,
                 "created": !existed,
             })),
+            images: Vec::new(),
         })
     }
 }

@@ -48,6 +48,7 @@ fn event_schema_is_stable() {
                 content: "no".to_owned(),
                 truncated: false,
                 process_id: None,
+                images: Vec::new(),
             },
             json!({
                 "type": "tool_result",

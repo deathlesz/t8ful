@@ -97,6 +97,11 @@ pub enum AgentEvent {
         /// A frontend can bind later display-only progress to the same card.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         process_id: Option<String>,
+        /// Images the tool returned, stored in session-owned storage. A frontend
+        /// renders them under the card; the model sees them through the request
+        /// the transport builds.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageInput>,
     },
     /// A user-authored message that entered the conversation. Emitted after the
     /// journal append so every frontend can echo it exactly once.

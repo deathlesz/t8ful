@@ -18,7 +18,6 @@ use t8ful_core::journal::UsageRecord;
 use t8ful_core::message::Message;
 use t8ful_core::notice::{Notice, ProcessNotice};
 use t8ful_core::policy::Mode;
-use t8ful_core::provider::ModelInfo;
 use t8ful_core::tool::ToolStatus;
 use t8ful_tools::{ManagedProcesses, ProcessExit, ProcessState};
 use t8ful_tui::bridge::{
@@ -32,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compose::{McpStartup, Session};
 use crate::images;
+use crate::providers::Catalog;
 use crate::session::{QueuedInput, SessionId, SessionJournal};
 use crate::state::StatePaths;
 use crate::usage::UsageLedger;
@@ -54,6 +54,12 @@ pub struct DriverInit {
     pub max_image_encoded_bytes: usize,
     /// Wake an idle agent when a background process exits.
     pub notify_on_exit: bool,
+    /// The OpenRouter credential in effect, so a Go login keeps it.
+    pub openrouter_api_key: Option<String>,
+    /// The OpenCode Go credential in effect.
+    pub opencode_go_api_key: Option<String>,
+    /// Where each credential came from at startup.
+    pub sources: crate::AuthSources,
 }
 
 struct Runtime {
@@ -73,7 +79,7 @@ struct Runtime {
     queue: VecDeque<QueuedInput>,
     queue_paused: bool,
     pending_images: Vec<ImageInput>,
-    pending_model: Option<String>,
+    pending_model: Option<t8ful_tui::bridge::ModelRow>,
     pending_mode: Option<Mode>,
     /// A new session requested mid-turn, applied at the boundary.
     pending_new_session: Option<(Option<Mode>, Option<String>)>,
@@ -81,6 +87,11 @@ struct Runtime {
     process_notices: Vec<ProcessNotice>,
     notify_on_exit: bool,
     quit: bool,
+    /// The credentials in effect, so one provider's login keeps the other's.
+    openrouter_api_key: Option<String>,
+    opencode_go_api_key: Option<String>,
+    /// Where each active credential came from, seeded at startup.
+    sources: crate::AuthSources,
     /// Set when the user cancelled a turn.
     ///
     /// A cancel must leave the session idle until the user speaks again. Without
@@ -91,6 +102,14 @@ struct Runtime {
 }
 
 impl Runtime {
+    /// The credential state both providers are in.
+    fn auth_snapshot(&self) -> AuthSnapshot {
+        AuthSnapshot {
+            openrouter: auth_kind(self.sources.openrouter),
+            opencode_go: auth_kind(self.sources.opencode_go),
+        }
+    }
+
     fn queue_snapshot(&self) -> Vec<String> {
         self.queue.iter().map(|item| item.text.clone()).collect()
     }
@@ -210,6 +229,15 @@ impl Runtime {
     }
 }
 
+/// Map one credential source onto the snapshot the TUI renders.
+fn auth_kind(source: crate::auth::AuthSource) -> t8ful_tui::AuthKind {
+    match source {
+        crate::auth::AuthSource::Environment => t8ful_tui::AuthKind::Environment,
+        crate::auth::AuthSource::Stored => t8ful_tui::AuthKind::Stored,
+        crate::auth::AuthSource::Missing => t8ful_tui::AuthKind::Missing,
+    }
+}
+
 /// The catalog fetch currently in flight, plus the channels that publish it.
 ///
 /// A credential change replaces the whole thing: aborting the old task and
@@ -219,7 +247,7 @@ struct CatalogRun {
     pending: bool,
     generation: u64,
     task: Option<tokio::task::JoinHandle<()>>,
-    result: Option<oneshot::Receiver<Result<Vec<ModelInfo>, String>>>,
+    result: Option<oneshot::Receiver<Result<Catalog, String>>>,
     snapshot_tx: watch::Sender<CatalogSnapshot>,
     reasoning_tx: watch::Sender<ReasoningSnapshot>,
     auth_tx: watch::Sender<AuthSnapshot>,
@@ -256,18 +284,36 @@ impl CatalogRun {
         self.generation += 1;
     }
 
-    /// Fetch the catalog for the session's current provider.
+    /// Fetch the catalog for the session's current providers.
+    ///
+    /// The routing handle is shared, so the task does not borrow the session;
+    /// the result arrives on a one-shot channel the loop can poll alongside
+    /// commands.
     fn restart(&mut self, session: &Session) {
         self.abort();
 
         let (result_tx, result_rx) = oneshot::channel();
+        let routing = session.routing.clone();
         let provider = Arc::clone(&session.provider);
         let catalog_timeout = session.catalog_timeout;
 
         self.pending = true;
         self.result = Some(result_rx);
         self.task = Some(tokio::spawn(async move {
-            let result = crate::compose::fetch_catalog(provider, catalog_timeout).await;
+            let result = match routing {
+                Some(routing) => {
+                    match tokio::time::timeout(catalog_timeout, routing.catalog(catalog_timeout))
+                        .await
+                    {
+                        Ok(catalog) => crate::compose::settle_catalog(catalog),
+                        Err(_) => Err(format!(
+                            "model catalog request timed out after {} ms",
+                            catalog_timeout.as_millis()
+                        )),
+                    }
+                }
+                None => crate::compose::fetch_catalog(provider, catalog_timeout).await,
+            };
 
             let _ = result_tx.send(result);
         }));
@@ -276,7 +322,7 @@ impl CatalogRun {
     fn finish(
         &mut self,
         session: &mut Session,
-        result: Result<Vec<ModelInfo>, String>,
+        result: Result<Catalog, String>,
         events: &EventEmitter,
     ) {
         self.result = None;
@@ -395,7 +441,7 @@ impl Pending {
 type McpResult = Result<(t8ful_mcp::McpHub, Vec<String>), oneshot::error::RecvError>;
 
 enum DiscoveryEvent {
-    Catalog(Result<Result<Vec<ModelInfo>, String>, oneshot::error::RecvError>),
+    Catalog(Result<Result<Catalog, String>, oneshot::error::RecvError>),
     Mcp(McpResult),
     Command(Option<TuiCommand>),
 }
@@ -492,6 +538,9 @@ pub async fn drive(mut session: Session, endpoints: TuiEndpoints, init: DriverIn
         session_id,
         max_image_encoded_bytes,
         notify_on_exit,
+        openrouter_api_key,
+        opencode_go_api_key,
+        sources,
     } = init;
 
     // The forwarder also keeps the agent and task snapshots live. It sees every
@@ -542,6 +591,9 @@ pub async fn drive(mut session: Session, endpoints: TuiEndpoints, init: DriverIn
         pending_mode: None,
         pending_new_session: None,
         process_notices: Vec::new(),
+        openrouter_api_key,
+        opencode_go_api_key,
+        sources,
         notify_on_exit,
         quit: false,
         cancelled_by_user: false,
@@ -1040,8 +1092,8 @@ async fn handle_command(
 
             true
         }
-        TuiCommand::Logout => {
-            logout(session, runtime, &mut discovery.catalog, events).await;
+        TuiCommand::Logout { provider } => {
+            logout(session, runtime, &mut discovery.catalog, &provider, events).await;
 
             true
         }
@@ -1187,14 +1239,20 @@ async fn handle_command(
     }
 }
 
-/// The environment override, which always wins over a stored key.
-fn environment_key() -> Option<String> {
-    std::env::var("OPENROUTER_API_KEY")
+/// The environment override for one provider, which always wins over a stored
+/// key.
+fn environment_key(provider: &str) -> Option<String> {
+    let variable = crate::auth::environment_variable(provider)?;
+
+    std::env::var(variable)
         .ok()
         .filter(|key| !key.trim().is_empty())
 }
 
 /// Save a key, then make it active if the environment does not override it.
+///
+/// The key is stored for the named provider only; the other provider's client
+/// and stored key are untouched.
 async fn login(
     session: &mut Session,
     runtime: &mut Runtime,
@@ -1203,17 +1261,18 @@ async fn login(
     key: t8ful_tui::bridge::Secret,
     events: &EventEmitter,
 ) {
-    if !provider.eq_ignore_ascii_case("openrouter") {
+    if !crate::auth::is_known_provider(provider) {
         events.send(AgentEvent::Error {
-            message: format!("unknown provider `{provider}`; only openrouter is supported"),
+            message: format!("unknown provider `{provider}`; use `openrouter` or `opencode-go`"),
         });
 
         return;
     }
 
+    let canonical = crate::state::canonical_provider(provider);
     let key = key.into_inner();
 
-    if let Err(error) = crate::auth::save(&crate::auth::path(&runtime.paths), &key) {
+    if let Err(error) = crate::auth::save(&crate::auth::path(&runtime.paths), canonical, &key) {
         events.send(AgentEvent::Error {
             message: error.to_string(),
         });
@@ -1221,32 +1280,40 @@ async fn login(
         return;
     }
 
-    let environment = environment_key();
+    let environment = environment_key(canonical);
     let active = environment.clone().or(Some(key));
-    let source = if environment.is_some() {
-        AuthSnapshot::Environment
-    } else {
-        AuthSnapshot::Stored
-    };
+    let route = crate::providers::Route::from_id(canonical).unwrap_or_default();
 
-    apply_credentials(session, runtime, catalog, active, source, events).await;
+    apply_credentials(session, runtime, catalog, route, active, events).await;
 
     if environment.is_some() {
+        let variable = crate::auth::environment_variable(canonical).unwrap_or_default();
+
         events.send(AgentEvent::Warning {
-            message: "OPENROUTER_API_KEY is set, so the saved key is stored but not used"
-                .to_owned(),
+            message: format!("{variable} is set, so the saved key is stored but not used"),
         });
     }
 }
 
-/// Forget the stored key; an environment key keeps the session connected.
+/// Forget one provider's stored key; an environment key keeps it connected.
 async fn logout(
     session: &mut Session,
     runtime: &mut Runtime,
     catalog: &mut CatalogRun,
+    provider: &str,
     events: &EventEmitter,
 ) {
-    if let Err(error) = crate::auth::remove(&crate::auth::path(&runtime.paths)) {
+    if !crate::auth::is_known_provider(provider) {
+        events.send(AgentEvent::Error {
+            message: format!("unknown provider `{provider}`; use `openrouter` or `opencode-go`"),
+        });
+
+        return;
+    }
+
+    let canonical = crate::state::canonical_provider(provider);
+
+    if let Err(error) = crate::auth::remove(&crate::auth::path(&runtime.paths), canonical) {
         events.send(AgentEvent::Error {
             message: error.to_string(),
         });
@@ -1254,46 +1321,50 @@ async fn logout(
         return;
     }
 
-    let environment = environment_key();
-
-    if let Some(key) = environment.clone() {
-        apply_credentials(
-            session,
-            runtime,
-            catalog,
-            Some(key),
-            AuthSnapshot::Environment,
-            events,
-        )
-        .await;
-        events.send(AgentEvent::Warning {
-            message: "OPENROUTER_API_KEY is set, so the session stays connected".to_owned(),
-        });
-
-        return;
-    }
+    let environment = environment_key(canonical);
+    let route = crate::providers::Route::from_id(canonical).unwrap_or_default();
 
     apply_credentials(
         session,
         runtime,
         catalog,
-        None,
-        AuthSnapshot::Missing,
+        route,
+        environment.clone(),
         events,
     )
     .await;
+
+    if environment.is_some() {
+        let variable = crate::auth::environment_variable(canonical).unwrap_or_default();
+
+        events.send(AgentEvent::Warning {
+            message: format!("{variable} is set, so the session stays connected"),
+        });
+    }
 }
 
-/// Swap the provider credential and reload the catalog it can see.
+/// Swap one provider's credential and reload the catalog it can see.
+///
+/// Only the affected provider's client is rebuilt; the other keeps its
+/// credential and its connection, so logging into Go never disconnects
+/// OpenRouter.
 async fn apply_credentials(
     session: &mut Session,
     runtime: &mut Runtime,
     catalog: &mut CatalogRun,
+    route: crate::providers::Route,
     api_key: Option<String>,
-    source: AuthSnapshot,
     events: &EventEmitter,
 ) {
-    if let Err(error) = session.set_credentials(api_key) {
+    let mut openrouter = runtime.openrouter_api_key.clone();
+    let mut opencode = runtime.opencode_go_api_key.clone();
+
+    match route {
+        crate::providers::Route::OpenRouter => openrouter = api_key.clone(),
+        crate::providers::Route::OpencodeGo => opencode = api_key.clone(),
+    }
+
+    if let Err(error) = session.set_credentials(openrouter.clone(), opencode.clone()) {
         events.send(AgentEvent::Error {
             message: format!("cannot switch credentials: {error}"),
         });
@@ -1301,7 +1372,24 @@ async fn apply_credentials(
         return;
     }
 
-    let _ = catalog.auth_tx.send(source);
+    runtime.openrouter_api_key = openrouter;
+    runtime.opencode_go_api_key = opencode;
+
+    // The login modal shows the source of the provider it is about to save a key
+    // for, so the snapshot follows every login and logout.
+    let environment = environment_key(route.id()).is_some();
+    let source = match (&api_key, environment) {
+        (Some(_), true) => crate::auth::AuthSource::Environment,
+        (Some(_), false) => crate::auth::AuthSource::Stored,
+        (None, _) => crate::auth::AuthSource::Missing,
+    };
+
+    match route {
+        crate::providers::Route::OpenRouter => runtime.sources.openrouter = source,
+        crate::providers::Route::OpencodeGo => runtime.sources.opencode_go = source,
+    }
+
+    let _ = catalog.auth_tx.send(runtime.auth_snapshot());
     let _ = catalog.snapshot_tx.send(CatalogSnapshot::Pending);
     runtime.pending_model = None;
 
@@ -1314,16 +1402,31 @@ async fn apply_credentials(
 
 fn publish_catalog(
     session: &mut Session,
-    result: Result<Vec<ModelInfo>, String>,
+    result: Result<Catalog, String>,
     catalog_tx: &watch::Sender<CatalogSnapshot>,
     reasoning_tx: &watch::Sender<ReasoningSnapshot>,
     events: &EventEmitter,
 ) {
     match result {
-        Ok(models) => {
-            let model_ids = models.iter().map(|model| model.id.clone()).collect();
+        Ok(catalog) => {
+            let model_rows = catalog
+                .models
+                .iter()
+                .map(|model| {
+                    t8ful_tui::bridge::ModelRow::new(model.id.clone(), model.provider.clone())
+                })
+                .collect::<Vec<_>>();
 
-            match session.apply_catalog(Ok(models)) {
+            // A provider whose catalog failed is reported and its models are
+            // simply absent; the other provider's models still work.
+            for warning in &catalog.warnings {
+                tracing::warn!(target: "t8ful::driver", "{warning}");
+                events.send(AgentEvent::Warning {
+                    message: warning.clone(),
+                });
+            }
+
+            match session.apply_catalog(Ok(catalog)) {
                 Ok(Some(message)) => {
                     tracing::warn!(target: "t8ful::driver", "{message}");
                     events.send(AgentEvent::Warning { message });
@@ -1353,7 +1456,7 @@ fn publish_catalog(
                 effort: session.agent.reasoning_effort(),
             });
 
-            let _ = catalog_tx.send(CatalogSnapshot::Loaded { models: model_ids });
+            let _ = catalog_tx.send(CatalogSnapshot::Loaded { models: model_rows });
             let _ = reasoning_tx.send(ReasoningSnapshot::Loaded {
                 levels: session.agent.reasoning_profile().levels(),
             });
@@ -1551,19 +1654,20 @@ async fn execute_turn(
                             runtime.queue_clear(&journal, events).await;
                             let _ = session.agent.take_pending_steering();
                         }
-                        TuiCommand::Login { .. } | TuiCommand::Logout => {
+                        TuiCommand::Login { .. } | TuiCommand::Logout { .. } => {
                             events.send(AgentEvent::Warning {
                                 message: "finish the current turn before logging in/out"
                                     .to_owned(),
                             });
                         }
                         TuiCommand::SelectModel(model) => {
-                            runtime.pending_model = Some(model.clone());
                             events.send(AgentEvent::Warning {
                                 message: format!(
-                                    "model `{model}` will be applied at the next turn boundary"
+                                    "model `{}` will be applied at the next turn boundary",
+                                    model.label()
                                 ),
                             });
+                            runtime.pending_model = Some(model.clone());
                         }
                         TuiCommand::SetReasoningEffort(effort) => {
                             apply_reasoning(session, effort, events).await;
@@ -1731,34 +1835,33 @@ async fn handle_turn_end(
 
 async fn apply_model(
     session: &mut Session,
-    model: &str,
+    model: &t8ful_tui::bridge::ModelRow,
     events: &EventEmitter,
     reasoning_tx: &watch::Sender<ReasoningSnapshot>,
     context_tx: &watch::Sender<ContextSnapshot>,
 ) {
-    match session.select_model(model) {
-        Ok(warning) => {
-            if let Some(message) = warning {
-                events.send(AgentEvent::Warning { message });
-            }
-        }
-        Err(error) => {
-            events.send(AgentEvent::Error {
-                message: format!("cannot select model `{model}`: {error}"),
-            });
+    if let Err(error) = session.select_model_from_row(&model.id, model.provider.as_deref()) {
+        events.send(AgentEvent::Error {
+            message: format!("cannot select model `{}`: {error}", model.label()),
+        });
 
-            return;
-        }
+        return;
+    }
+
+    if let Some(message) = session.take_selection_warning() {
+        events.send(AgentEvent::Warning { message });
     }
 
     let selected = session.agent.model().to_owned();
+    let provider = session.selected_route().map(|route| route.id().to_owned());
 
     if let Some(journal) = &session.journal {
         let _ = journal
-            .record_settings(
+            .record_settings_with_provider(
                 Some(selected.clone()),
                 session.mode,
                 session.agent.reasoning_effort(),
+                provider,
             )
             .await;
     }
@@ -1996,7 +2099,7 @@ fn history_entries(conversation: &t8ful_core::message::Conversation) -> Vec<Hist
                     entries.push(HistoryEntry {
                         role: HistoryRole::Tool,
                         text: result.content.clone(),
-                        images: Vec::new(),
+                        images: result.images.clone(),
                         tool: Some(result.name.clone()),
                         arguments: arguments.get(result.call_id.as_str()).cloned(),
                         status: Some(result.status),
@@ -2109,12 +2212,15 @@ async fn new_session(
     let model = session.agent.model().to_owned();
     let effort = session.agent.reasoning_effort();
 
+    let provider = session.selected_route().map(|route| route.id().to_owned());
+
     match SessionJournal::pending(
         &runtime.paths,
         &runtime.project_root,
         Some(model.clone()),
         mode,
         effort,
+        provider,
         Some(Arc::clone(&runtime.ledger)),
     ) {
         Ok(journal) => {
@@ -2134,6 +2240,7 @@ async fn new_session(
 
             session.journal = Some(journal);
             session.set_current_session(Some(id.clone()));
+            session.agent.set_session_id(id.clone());
             runtime.queue.clear();
             runtime.pending_images.clear();
             runtime.process_notices.clear();
@@ -2228,16 +2335,24 @@ async fn resume_session(
             session.mode = mode;
 
             if let Some(model) = loaded.model.clone() {
-                match session.select_model(&model) {
-                    Ok(Some(message)) => {
-                        events.send(AgentEvent::Warning { message });
-                    }
-                    Ok(None) => {}
+                // A journal that recorded its provider re-selects the same copy
+                // of a duplicated id; an older one falls back to the index.
+                let selection = match loaded.provider.as_deref() {
+                    Some(provider) => session.select_model_from_row(&model, Some(provider)),
+                    None => session.select_model(&model).map(|_| ()),
+                };
+
+                match selection {
+                    Ok(()) => {}
                     Err(error) => {
                         events.send(AgentEvent::Error {
                             message: format!("cannot select resumed model `{model}`: {error}"),
                         });
                     }
+                }
+
+                if let Some(message) = session.take_selection_warning() {
+                    events.send(AgentEvent::Warning { message });
                 }
             }
 
@@ -2250,6 +2365,7 @@ async fn resume_session(
             session.conversation = loaded.conversation;
             session.journal = Some(journal);
             session.set_current_session(Some(id.to_string()));
+            session.agent.set_session_id(id.to_string());
             runtime.queue = loaded.queued.into();
             runtime.queue_paused = loaded.queue_paused;
             runtime.pending_images.clear();
@@ -2597,6 +2713,15 @@ mod tests {
         assert_eq!(entries[0].role, HistoryRole::Info);
         assert_eq!(entries[1].role, HistoryRole::Info);
         assert_eq!(entries[2].role, HistoryRole::User);
+        // The envelope reaches the frontend intact: the TUI decodes it back
+        // into a notice card, and a reworded copy here would defeat that.
+        assert!(entries[0].text.starts_with("<agent_notice agent=\"a1\""));
+        assert!(
+            entries[1]
+                .text
+                .starts_with("<process_notice id=\"process-1\"")
+        );
+        assert!(entries[1].text.contains("</process_notice>"));
     }
 
     #[test]

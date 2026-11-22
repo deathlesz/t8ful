@@ -103,6 +103,7 @@ impl Tool for BashTool {
                 ),
                 truncated: false,
                 metadata: Some(json!({ "process_id": id, "background": true })),
+                images: Vec::new(),
             });
         }
 
@@ -158,6 +159,7 @@ impl Tool for BashTool {
                 "cleanup_error": outcome.cleanup_error,
                 "sandboxed": false,
             })),
+            images: Vec::new(),
         })
     }
 }
@@ -469,6 +471,7 @@ async fn execute_sandboxed(
             "output_incomplete": output_incomplete,
             "command": label,
         })),
+        images: Vec::new(),
     })
 }
 
@@ -742,6 +745,7 @@ mod tests {
             ("TZ", "UTC"),
             ("AWS_SECRET_ACCESS_KEY", "secret"),
             ("OPENROUTER_API_KEY", "sk-or-secret"),
+            ("OPENCODE_GO_API_KEY", "oc_sk-secret"),
             ("TERM", "xterm"),
         ]
         .into_iter()

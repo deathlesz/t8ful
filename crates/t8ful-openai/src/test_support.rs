@@ -1,10 +1,9 @@
-#![allow(dead_code)]
-//! Minimal loopback HTTP/1.1 + SSE server used by provider tests.
+//! Minimal loopback HTTP/1.1 + SSE server shared by provider test suites.
 //!
 //! It speaks just enough HTTP to serve scripted replies and records each request
-//! so tests can assert on authentication and the JSON body. Replies are written
-//! as caller-provided chunks, which lets tests split SSE frames at arbitrary
-//! byte boundaries and truncate streams on purpose.
+//! so tests can assert on authentication, headers, and the JSON body. Replies
+//! are written as caller-provided chunks, which lets tests split SSE frames at
+//! arbitrary byte boundaries and truncate streams on purpose.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -19,13 +18,26 @@ pub struct RequestRecord {
     pub method: String,
     pub path: String,
     pub authorization: Option<String>,
+    /// Every request header, lowercased by name.
+    pub headers: Vec<(String, String)>,
     pub body: serde_json::Value,
+}
+
+impl RequestRecord {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Reply {
     pub status: u16,
     pub content_type: String,
+    /// Extra response headers, written after the fixed ones.
+    pub headers: Vec<(String, String)>,
     pub chunks: Vec<Vec<u8>>,
     pub delay: Duration,
 }
@@ -35,6 +47,7 @@ impl Reply {
         Self {
             status: 200,
             content_type: "text/event-stream".to_owned(),
+            headers: Vec::new(),
             chunks,
             delay: Duration::ZERO,
         }
@@ -48,6 +61,7 @@ impl Reply {
         Self {
             status,
             content_type: "application/json".to_owned(),
+            headers: Vec::new(),
             chunks: vec![body.into().into_bytes()],
             delay: Duration::ZERO,
         }
@@ -55,6 +69,11 @@ impl Reply {
 
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
         self
     }
 }
@@ -141,12 +160,16 @@ async fn serve(
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
             .map(|(_, value)| value.clone()),
+        headers: headers.clone(),
         body: parsed_body,
     });
 
     let reason = match reply.status {
         200 => "OK",
+        400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -154,8 +177,15 @@ async fn serve(
     };
 
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-        reply.status, reason, reply.content_type
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n{}\r\n",
+        reply.status,
+        reason,
+        reply.content_type,
+        reply
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>()
     );
 
     stream.write_all(head.as_bytes()).await?;

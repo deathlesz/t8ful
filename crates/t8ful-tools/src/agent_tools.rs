@@ -353,6 +353,7 @@ impl Tool for SpawnAgentsTool {
             ),
             truncated: false,
             metadata: Some(json!({ "agents": ids })),
+            images: Vec::new(),
         })
     }
 }
@@ -549,6 +550,7 @@ impl Tool for AgentWaitTool {
                 "finished": reports.len(),
                 "running": running.iter().map(AgentId::as_str).collect::<Vec<_>>(),
             })),
+            images: Vec::new(),
         })
     }
 }
@@ -669,6 +671,7 @@ impl Tool for AgentStatusTool {
             metadata: Some(json!({
                 "running": registry.running(),
             })),
+            images: Vec::new(),
         })
     }
 }

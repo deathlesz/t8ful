@@ -78,6 +78,39 @@ impl LoginModal {
     }
 }
 
+/// Whether a name is one of the providers t8ful talks to.
+pub fn is_known_provider(provider: &str) -> bool {
+    let trimmed = provider.trim();
+
+    trimmed.eq_ignore_ascii_case("openrouter")
+        || trimmed.eq_ignore_ascii_case("opencode-go")
+        || trimmed.eq_ignore_ascii_case("opencode")
+        || trimmed.eq_ignore_ascii_case("opencode_go")
+}
+
+/// Canonical spelling of a provider name the TUI accepts.
+pub fn normalize_provider(provider: &str) -> &'static str {
+    if login_environment_variable(provider) == "OPENCODE_GO_API_KEY" {
+        "opencode-go"
+    } else {
+        "openrouter"
+    }
+}
+
+/// The credential variable shown in the login modal for one provider.
+///
+/// The TUI names it for display only; the driver decides where a key is stored.
+pub fn login_environment_variable(provider: &str) -> &'static str {
+    if provider.eq_ignore_ascii_case("opencode-go")
+        || provider.eq_ignore_ascii_case("opencode")
+        || provider.eq_ignore_ascii_case("opencode_go")
+    {
+        "OPENCODE_GO_API_KEY"
+    } else {
+        "OPENROUTER_API_KEY"
+    }
+}
+
 impl std::fmt::Debug for LoginModal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoginModal")
@@ -99,9 +132,14 @@ pub fn friendly_tool_name(id: &str) -> Cow<'_, str> {
         "write_file" => Cow::Borrowed("Write"),
         "read_file" => Cow::Borrowed("Read"),
         "bash" => Cow::Borrowed("Bash"),
-        "process_output" | "process_status" | "process_list" | "process_wait" | "process_stop" => {
-            Cow::Borrowed("Process")
-        }
+        // The domain noun leads and the detail follows, the same convention
+        // `Read src/lib.rs` uses. These five carry no path or command, so the
+        // label is the whole header and has to say which call it is.
+        "process_output" => Cow::Borrowed("Process output"),
+        "process_status" => Cow::Borrowed("Process status"),
+        "process_list" => Cow::Borrowed("Process list"),
+        "process_wait" => Cow::Borrowed("Process wait"),
+        "process_stop" => Cow::Borrowed("Process stop"),
         "ask_user_question" => Cow::Borrowed("Ask"),
         "present_plan" => Cow::Borrowed("Plan"),
         "skill" => Cow::Borrowed("Skill"),
@@ -194,9 +232,20 @@ pub enum Entry {
         duration: Option<Duration>,
         /// Transcript position of the call that produced this card.
         placement: CardPlacement,
+        /// Images the tool returned, rendered under the card body.
+        images: Vec<t8ful_core::content::ImageInput>,
     },
     /// Provider reasoning, retained in memory for display only.
     Reasoning(String),
+    /// A background-process or child-agent completion, restored from the
+    /// journal. It is drawn as a card so it reads the way the live session
+    /// showed it, instead of exposing the wire envelope to a person.
+    Notice {
+        title: String,
+        body: String,
+        /// `ok`, `error`, or `info`; picks the card's glyph and color.
+        status: String,
+    },
     Error(String),
     Info(String),
     /// A plan presented with `present_plan`. It renders as one panel and is
@@ -240,6 +289,7 @@ impl Entry {
             Self::Startup { .. } => "startup",
             Self::Tool { .. } => "tool",
             Self::Reasoning(_) => "reasoning",
+            Self::Notice { .. } => "notice",
             Self::Error(_) => "error",
             Self::Info(_) => "info",
             Self::Plan { .. } => "plan",
@@ -258,6 +308,7 @@ impl Entry {
             Self::Startup { .. } => "",
             Self::Images(_) => "",
             Self::Tool { content, .. } => content,
+            Self::Notice { body, .. } => body,
             Self::Plan { body, .. } => body,
             Self::ModeChange { .. } => "",
             Self::Agent { prompt, report, .. } => report.as_deref().unwrap_or(prompt),
@@ -715,7 +766,8 @@ pub struct AppState {
     pub auth: crate::bridge::AuthSnapshot,
     /// The `/login` modal, while it is open.
     pub login: Option<LoginModal>,
-    pub models: Vec<String>,
+    /// The merged catalog, one row per (id, provider) pair.
+    pub models: Vec<crate::bridge::ModelRow>,
     /// Index of the highlighted row in [`AppState::picker_rows`].
     pub picker: Option<usize>,
     /// Fuzzy filter typed into the model picker.
@@ -829,7 +881,7 @@ impl AppState {
             usage: UsageTotals::default(),
             queue: Vec::new(),
             queue_paused: false,
-            auth: crate::bridge::AuthSnapshot::Missing,
+            auth: crate::bridge::AuthSnapshot::default(),
             login: None,
             models: Vec::new(),
             picker: None,
@@ -954,28 +1006,36 @@ impl AppState {
         self.transcript_height.max(1)
     }
 
-    /// Replace the model list used by the picker, preserving the selected ID.
-    pub fn set_models(&mut self, models: Vec<String>) {
+    /// Replace the model list used by the picker, preserving the selection.
+    ///
+    /// Rows are deduplicated on the `(id, provider)` pair: the same id served
+    /// by both providers stays two rows, so its Go copy stays reachable.
+    pub fn set_models(&mut self, models: Vec<crate::bridge::ModelRow>) {
         let selected = self.selected_model();
         let mut merged = models;
 
         if !self.header.model.trim().is_empty()
-            && !merged.iter().any(|model| model == &self.header.model)
+            && !merged
+                .iter()
+                .any(|model| model.id == self.header.model.trim())
         {
-            merged.insert(0, self.header.model.clone());
+            merged.insert(
+                0,
+                crate::bridge::ModelRow::new(self.header.model.clone(), None),
+            );
         }
 
         let mut seen = HashSet::new();
 
-        merged.retain(|model| seen.insert(model.clone()));
+        merged.retain(|model| seen.insert((model.id.clone(), model.provider.clone())));
         self.models = merged;
 
         if self.picker.is_some() {
             // The filter is re-applied to the new catalog; keep the highlighted
-            // model when it survived, otherwise start again at the top row.
+            // row when it survived, otherwise start again at the top row.
             let rows = self.picker_rows();
             let preserved =
-                selected.and_then(|model| rows.iter().position(|&row| self.models[row] == model));
+                selected.and_then(|row| rows.iter().position(|&index| self.models[index] == row));
 
             self.picker = Some(preserved.unwrap_or(0));
         }
@@ -983,15 +1043,19 @@ impl AppState {
 
     /// Model rows matching the typed filter, best match first.
     ///
-    /// The sort is stable and empty filters score every model equally, so the
-    /// catalog order survives untouched until the user types.
+    /// The filter matches the id *and* the provider name, so `/model opencode`
+    /// narrows to the Go catalog. The sort is stable and empty filters score
+    /// every model equally, so the catalog order survives until the user types.
     pub fn picker_rows(&self) -> Vec<usize> {
         let mut rows = self
             .models
             .iter()
             .enumerate()
             .filter_map(|(index, model)| {
-                Some((fuzzy::score(self.picker_filter.as_str(), model)?, index))
+                Some((
+                    fuzzy::score(self.picker_filter.as_str(), &model.filter_text())?,
+                    index,
+                ))
             })
             .collect::<Vec<_>>();
 
@@ -1032,7 +1096,7 @@ impl AppState {
         self.picker = Some(0);
     }
 
-    pub fn selected_model(&self) -> Option<String> {
+    pub fn selected_model(&self) -> Option<crate::bridge::ModelRow> {
         let rows = self.picker_rows();
         let index = *rows.get(self.picker?)?;
 
@@ -1407,7 +1471,9 @@ impl AppState {
 
                 self.streaming.clear();
 
-                if !text.is_empty() {
+                // A whitespace-only completion renders nothing, and an entry for
+                // it would still separate the cards around it.
+                if !text.trim().is_empty() {
                     self.entries.push(Entry::Assistant(text));
                 }
             }
@@ -1485,6 +1551,7 @@ impl AppState {
                 content,
                 truncated,
                 process_id,
+                images,
             } => {
                 self.commit_reasoning();
 
@@ -1585,6 +1652,7 @@ impl AppState {
                     preview,
                     duration: start.map(|start| start.started.elapsed()),
                     placement,
+                    images,
                 });
             }
             AgentEvent::SkillLoaded {
@@ -1605,6 +1673,7 @@ impl AppState {
                     preview: ToolPreview::default(),
                     duration: None,
                     placement,
+                    images: Vec::new(),
                 });
 
                 if !self.busy {
@@ -2020,6 +2089,10 @@ impl AppState {
 
                         vec![match role {
                             t8ful_core::event::HistoryRole::Assistant => {
+                                if entry.text.trim().is_empty() {
+                                    return Vec::new();
+                                }
+
                                 Entry::Assistant(entry.text)
                             }
                             t8ful_core::event::HistoryRole::Tool => {
@@ -2074,10 +2147,13 @@ impl AppState {
                                     preview,
                                     duration: None,
                                     placement: CardPlacement::default(),
+                                    images: entry.images,
                                 }
                             }
                             t8ful_core::event::HistoryRole::User => unreachable!("handled above"),
-                            t8ful_core::event::HistoryRole::Info => Entry::Info(entry.text),
+                            t8ful_core::event::HistoryRole::Info => {
+                                notice_entry(&entry.text).unwrap_or(Entry::Info(entry.text))
+                            }
                         }]
                     })
                     .collect();
@@ -2119,7 +2195,10 @@ impl AppState {
         let text = std::mem::take(&mut self.reasoning_buffer);
 
         self.reasoning_generation = self.reasoning_generation.wrapping_add(1);
-        self.entries.push(Entry::Reasoning(text));
+
+        if !text.trim().is_empty() {
+            self.entries.push(Entry::Reasoning(text));
+        }
     }
 
     /// Revision of the live reasoning block.
@@ -2248,6 +2327,7 @@ impl AppState {
             preview,
             duration: Some(started.elapsed()),
             placement,
+            images: Vec::new(),
         });
 
         true
@@ -2358,7 +2438,10 @@ impl AppState {
         let text = std::mem::take(&mut self.streaming);
 
         self.streaming_generation = self.streaming_generation.wrapping_add(1);
-        self.entries.push(Entry::Assistant(text));
+
+        if !text.trim().is_empty() {
+            self.entries.push(Entry::Assistant(text));
+        }
     }
 
     /// Take the submitted prompt, if any.
@@ -2774,6 +2857,13 @@ fn tool_title(tool: &str, arguments: &serde_json::Value) -> String {
                 .map(|command| command.lines().next().unwrap_or_default())
         })
         .or_else(|| arguments.get("name").and_then(serde_json::Value::as_str))
+        // The five process tools have no path or command; their id is the one
+        // thing that tells five wait/status calls apart.
+        .or_else(|| {
+            arguments
+                .get("process_id")
+                .and_then(serde_json::Value::as_str)
+        })
         .unwrap_or_default()
         .trim();
 
@@ -3081,6 +3171,72 @@ fn catalog_warning_entry(message: &str) -> Entry {
     ))
 }
 
+/// A restored notice, rebuilt as a card header and body.
+///
+/// Resume replays the conversation, and a notice arrives there as one message
+/// carrying its wire envelope. Showing that text verbatim puts escaped tags and
+/// `&amp;&amp;` in front of a person, so the envelope is decoded once here and the
+/// plain `Info` row stays the fallback for anything this does not recognise.
+fn notice_entry(text: &str) -> Option<Entry> {
+    let row = t8ful_core::notice::parse_notice(text)?;
+
+    Some(match row {
+        t8ful_core::notice::NoticeRow::Process(notice) => {
+            let mut title = format!("Process {} · {}", notice.process_id, notice.state);
+
+            if let Some(code) = notice.exit_code {
+                title.push_str(&format!(" (code {code})"));
+            }
+
+            if let Some(signal) = notice.signal {
+                title.push_str(&format!(" (signal {signal})"));
+            }
+
+            title.push_str(&format!(
+                " · {} · {}",
+                crate::spinner::format_elapsed(Duration::from_millis(
+                    notice.elapsed_ms.try_into().unwrap_or(u64::MAX)
+                )),
+                crate::images::human_bytes(notice.total_bytes),
+            ));
+
+            if notice.truncated {
+                title.push_str(" · truncated");
+            }
+
+            let mut body = format!("command: {}", notice.command);
+
+            if !notice.output_tail.is_empty() {
+                body.push('\n');
+                body.push_str(&notice.output_tail);
+            }
+
+            let status =
+                if notice.exit_code.is_some_and(|code| code != 0) || notice.signal.is_some() {
+                    "error"
+                } else {
+                    "ok"
+                };
+
+            Entry::Notice {
+                title,
+                body,
+                status: status.to_owned(),
+            }
+        }
+        t8ful_core::notice::NoticeRow::Agent(notice) => Entry::Notice {
+            title: format!("Agent {} · {}", notice.agent, notice.status),
+            body: notice.body,
+            status: match notice.status.as_str() {
+                "completed" => "ok",
+                "failed" | "cancelled" => "error",
+                _ => "info",
+            }
+            .to_owned(),
+        },
+    })
+}
+
 fn status_label(status: ToolStatus) -> String {
     match status {
         ToolStatus::Ok => "ok",
@@ -3144,6 +3300,49 @@ mod tests {
             friendly_tool_name("bash"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn each_process_tool_keeps_its_own_label() {
+        // All five used to collapse to `Process`, which made a card header say
+        // nothing about which call it was.
+        for (id, expected) in [
+            ("process_output", "Process output"),
+            ("process_status", "Process status"),
+            ("process_list", "Process list"),
+            ("process_wait", "Process wait"),
+            ("process_stop", "Process stop"),
+            // A server that happens to be called `process` stays distinct from
+            // the builtins, which is the point of the namespace rendering.
+            ("mcp__process__output", "Process · output"),
+        ] {
+            assert_eq!(friendly_tool_name(id), expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn a_process_card_title_names_the_process_it_queried() {
+        // The label says which call it is; the title says which process. Without
+        // both, five wait/status calls are indistinguishable from each other.
+        assert_eq!(
+            super::tool_title(
+                "process_status",
+                &serde_json::json!({ "process_id": "process-2" })
+            ),
+            "process-2"
+        );
+        assert_eq!(
+            super::tool_title("process_list", &serde_json::json!({})),
+            ""
+        );
+        // A path still wins, so an ordinary tool title is unchanged.
+        assert_eq!(
+            super::tool_title(
+                "read_file",
+                &serde_json::json!({ "path": "src/lib.rs", "process_id": "process-2" })
+            ),
+            "src/lib.rs"
+        );
     }
 
     #[test]
@@ -3313,6 +3512,136 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_process_notice_restores_as_a_notice_card() {
+        let mut state = state();
+        let envelope = t8ful_core::notice::ProcessNotice {
+            process_id: "process-1".to_owned(),
+            command: "cd /work && cargo test 2>&1 | tail -5".to_owned(),
+            state: "exited".to_owned(),
+            exit_code: Some(0),
+            signal: None,
+            elapsed_ms: 30_500,
+            total_bytes: 431,
+            truncated: false,
+            output_tail: "test result: ok".to_owned(),
+        }
+        .render();
+
+        state.apply_event(AgentEvent::HistoryRestored {
+            entries: vec![HistoryEntry {
+                role: HistoryRole::Info,
+                text: envelope,
+                images: Vec::new(),
+                tool: None,
+                arguments: None,
+                status: None,
+                truncated: false,
+            }],
+        });
+
+        assert_eq!(state.entries.len(), 1, "{:?}", state.entries);
+        let Entry::Notice {
+            title,
+            body,
+            status,
+        } = &state.entries[0]
+        else {
+            panic!("a notice card: {:?}", state.entries[0]);
+        };
+
+        assert_eq!(status, "ok");
+        assert!(title.contains("process-1"), "{title}");
+        assert!(title.contains("exited"), "{title}");
+        assert!(title.contains("code 0"), "{title}");
+        assert!(title.contains("431 B"), "{title}");
+        assert!(body.contains("cd /work && cargo test 2>&1"), "{body}");
+        assert!(body.contains("test result: ok"), "{body}");
+        assert!(!body.contains("&amp;"), "{body}");
+        assert!(!body.contains("&gt;"), "{body}");
+        assert!(!body.contains("<process_notice"), "{body}");
+    }
+
+    #[test]
+    fn a_failed_process_notice_restores_with_an_error_status() {
+        let mut state = state();
+        let envelope = t8ful_core::notice::ProcessNotice {
+            process_id: "process-2".to_owned(),
+            command: "cargo bench".to_owned(),
+            state: "exited".to_owned(),
+            exit_code: Some(101),
+            signal: None,
+            elapsed_ms: 900,
+            total_bytes: 12,
+            truncated: false,
+            output_tail: String::new(),
+        }
+        .render();
+
+        state.apply_event(AgentEvent::HistoryRestored {
+            entries: vec![HistoryEntry {
+                role: HistoryRole::Info,
+                text: envelope,
+                images: Vec::new(),
+                tool: None,
+                arguments: None,
+                status: None,
+                truncated: false,
+            }],
+        });
+
+        let Some(Entry::Notice { status, title, .. }) = state.entries.first() else {
+            panic!("a notice card: {:?}", state.entries);
+        };
+
+        assert_eq!(status, "error");
+        assert!(title.contains("(code 101)"), "{title}");
+    }
+
+    #[test]
+    fn an_unrecognised_info_line_restores_as_information() {
+        for text in [
+            "warning: <process_notice> is mentioned inline".to_owned(),
+            "restored 3 entries".to_owned(),
+            "<process_notice id=\"process-1\">no closing tag".to_owned(),
+        ] {
+            let mut state = state();
+
+            state.apply_event(AgentEvent::HistoryRestored {
+                entries: vec![HistoryEntry {
+                    role: HistoryRole::Info,
+                    text: text.clone(),
+                    images: Vec::new(),
+                    tool: None,
+                    arguments: None,
+                    status: None,
+                    truncated: false,
+                }],
+            });
+
+            assert_eq!(state.entries, vec![Entry::Info(text.clone())], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_whitespace_only_restored_message_occupies_no_entry() {
+        let mut state = state();
+
+        state.apply_event(AgentEvent::HistoryRestored {
+            entries: vec![HistoryEntry {
+                role: HistoryRole::Assistant,
+                text: "\n\n".to_owned(),
+                images: Vec::new(),
+                tool: None,
+                arguments: None,
+                status: None,
+                truncated: false,
+            }],
+        });
+
+        assert!(state.entries.is_empty(), "{:?}", state.entries);
+    }
+
+    #[test]
     fn streaming_text_is_committed_once() {
         let mut state = state();
 
@@ -3398,31 +3727,23 @@ mod tests {
         assert!(state.status.contains("loading model catalog"));
 
         state.apply_catalog(crate::bridge::CatalogSnapshot::Loaded {
-            models: vec!["vendor/one".to_owned(), "vendor/two".to_owned()],
+            models: vec![row("vendor/one"), row("vendor/two")],
         });
 
         assert_eq!(
             state.models,
-            vec![
-                "openrouter/test".to_owned(),
-                "vendor/one".to_owned(),
-                "vendor/two".to_owned()
-            ]
+            vec![row("openrouter/test"), row("vendor/one"), row("vendor/two")]
         );
         assert!(!state.catalog_pending());
         assert_eq!(state.status, "ready");
 
         state.picker = Some(2);
         state.apply_catalog(crate::bridge::CatalogSnapshot::Loaded {
-            models: vec![
-                "vendor/one".to_owned(),
-                "vendor/two".to_owned(),
-                "vendor/three".to_owned(),
-            ],
+            models: vec![row("vendor/one"), row("vendor/two"), row("vendor/three")],
         });
 
         assert_eq!(state.picker, Some(2));
-        assert_eq!(state.models[2], "vendor/two");
+        assert_eq!(state.models[2].id, "vendor/two");
 
         state.apply_catalog(crate::bridge::CatalogSnapshot::Failed {
             message: "offline".to_owned(),
@@ -3549,15 +3870,63 @@ mod tests {
         let mut state = state();
 
         state.set_models(vec![
-            "vendor/one".to_owned(),
-            "vendor/one".to_owned(),
-            "openrouter/test".to_owned(),
+            row("vendor/one"),
+            row("vendor/one"),
+            row("openrouter/test"),
         ]);
 
         assert_eq!(
             state.models,
-            vec!["vendor/one".to_owned(), "openrouter/test".to_owned()]
+            vec![row("vendor/one"), row("openrouter/test")]
         );
+    }
+
+    /// A catalog row with no provider, as a single-provider build produces.
+    fn row(id: &str) -> crate::bridge::ModelRow {
+        crate::bridge::ModelRow::new(id, None)
+    }
+
+    #[test]
+    fn the_same_id_from_both_providers_stays_two_rows() {
+        let mut state = state();
+
+        state.header.model = "deepseek-v4.1-flash".to_owned();
+
+        state.set_models(vec![
+            crate::bridge::ModelRow::new("deepseek-v4.1-flash", Some("openrouter".to_owned())),
+            crate::bridge::ModelRow::new("deepseek-v4.1-flash", Some("opencode-go".to_owned())),
+        ]);
+
+        assert_eq!(state.models.len(), 2);
+        assert_eq!(state.models[0].label(), "deepseek-v4.1-flash [openrouter]");
+        assert_eq!(state.models[1].label(), "deepseek-v4.1-flash [opencode-go]");
+    }
+
+    #[test]
+    fn the_picker_filter_matches_the_provider_name_too() {
+        let mut state = state();
+
+        state.set_models(vec![
+            crate::bridge::ModelRow::new("kimi-k3", Some("opencode-go".to_owned())),
+            crate::bridge::ModelRow::new("vendor/sol", Some("openrouter".to_owned())),
+        ]);
+        state.picker = Some(0);
+        type_filter(&mut state, "opencode");
+
+        let rows = state.picker_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(state.models[rows[0]].id, "kimi-k3");
+        assert_eq!(
+            state.selected_model().map(|model| model.provider),
+            Some(Some("opencode-go".to_owned()))
+        );
+    }
+
+    fn type_filter(state: &mut AppState, text: &str) {
+        for character in text.chars() {
+            state.picker_push_char(character);
+        }
     }
 
     #[test]
@@ -3604,6 +3973,7 @@ mod tests {
             content: "started process-1 in the background".to_owned(),
             truncated: false,
             process_id: Some("process-1".to_owned()),
+            images: Vec::new(),
         });
 
         assert!(state.entries.is_empty(), "the live card was duplicated");
@@ -3673,6 +4043,7 @@ mod tests {
             content: "started process-1".to_owned(),
             truncated: false,
             process_id: Some("process-1".to_owned()),
+            images: Vec::new(),
         });
 
         assert!(state.tool_runs.is_empty());
@@ -3701,6 +4072,7 @@ mod tests {
             content: "started process-1".to_owned(),
             truncated: false,
             process_id: Some("process-1".to_owned()),
+            images: Vec::new(),
         });
         state.apply_event(AgentEvent::TurnFinished {
             turn: 1,
@@ -3733,6 +4105,7 @@ mod tests {
                 content: format!("{tool} result"),
                 truncated: false,
                 process_id: Some("process-1".to_owned()),
+                images: Vec::new(),
             });
         }
 
@@ -3776,6 +4149,7 @@ mod tests {
             content: "contents".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         assert_eq!(state.entries.len(), 3, "{:?}", state.entries);
@@ -3804,6 +4178,7 @@ mod tests {
             content: "started process-1".to_owned(),
             truncated: false,
             process_id: Some("process-1".to_owned()),
+            images: Vec::new(),
         });
         state.apply_event(AgentEvent::TextCompleted {
             text: "while it runs".to_owned(),
@@ -3844,6 +4219,7 @@ mod tests {
                 content: format!("{call_id} contents"),
                 truncated: false,
                 process_id: None,
+                images: Vec::new(),
             });
         }
 
@@ -3886,6 +4262,7 @@ mod tests {
             content: "started process-1".to_owned(),
             truncated: false,
             process_id: Some("process-1".to_owned()),
+            images: Vec::new(),
         });
 
         assert_eq!(state.tool_runs[0].progress, "");
@@ -3982,6 +4359,7 @@ mod tests {
             content: "denied by the user".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         assert_eq!(
@@ -3996,6 +4374,7 @@ mod tests {
                 preview: ToolPreview::default(),
                 duration: None,
                 placement: CardPlacement { anchor: 0, seq: 0 },
+                images: Vec::new(),
             }]
         );
     }
@@ -4057,6 +4436,7 @@ mod tests {
                 preview: ToolPreview::default(),
                 duration: None,
                 placement: CardPlacement { anchor: 0, seq: 0 },
+                images: Vec::new(),
             }]
         );
         assert_eq!(state.status, "skill review loaded");
@@ -4128,6 +4508,7 @@ mod tests {
             content: "[exit code 0, 1.0s]\ncompile done".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         assert!(state.tool_runs.is_empty(), "the result replaces the card");
@@ -4255,6 +4636,7 @@ mod tests {
             content: "contents".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         let Entry::Tool {
@@ -4419,6 +4801,7 @@ mod tests {
             content: "the plan was stored for review".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
         state.apply_event(AgentEvent::PlanPresented {
             plan: plan.to_owned(),
@@ -4457,6 +4840,7 @@ mod tests {
             content: "the plan was stored for review".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         assert_eq!(
@@ -4487,6 +4871,7 @@ mod tests {
             content: String::new(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         assert!(coding.plan_choice.is_none());
@@ -4713,6 +5098,7 @@ mod tests {
             content: "the plan must not be empty".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         assert_eq!(state.entries.len(), 1);
@@ -4791,6 +5177,7 @@ mod tests {
             content: "applied patch to 1 file(s): src/lib.rs (7 bytes)".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         let Entry::Tool { preview, .. } = &state.entries[0] else {
@@ -4821,6 +5208,7 @@ mod tests {
             content: content.to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         let Entry::Tool { title, preview, .. } = &state.entries[0] else {
@@ -4855,6 +5243,7 @@ mod tests {
             content: "fn main() {}".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         let Entry::Tool { preview, .. } = &state.entries[0] else {
@@ -4882,6 +5271,7 @@ mod tests {
             content: "diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         let Entry::Tool { preview, .. } = &state.entries[0] else {
@@ -4911,6 +5301,7 @@ mod tests {
             content: "denied by the user".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         let Entry::Tool { preview, .. } = &state.entries[0] else {
@@ -4939,6 +5330,7 @@ mod tests {
             content: "replaced 1 occurrence in src/lib.rs".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         let Entry::Tool { preview, .. } = &state.entries[0] else {
@@ -4973,6 +5365,7 @@ mod tests {
             content: "applied 2 edits (2 replacements)".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         let Entry::Tool { preview, .. } = &state.entries[0] else {
@@ -5003,6 +5396,7 @@ mod tests {
             content: "applied 1 edit (1 replacement)".to_owned(),
             truncated: false,
             process_id: None,
+            images: Vec::new(),
         });
 
         let Entry::Tool { preview, .. } = &state.entries[0] else {

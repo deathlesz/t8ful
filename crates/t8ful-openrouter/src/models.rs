@@ -218,6 +218,7 @@ impl ModelList {
 
                 ModelInfo {
                     id: entry.id,
+                    provider: None,
                     name: entry.name,
                     context_length,
                     max_output_tokens,

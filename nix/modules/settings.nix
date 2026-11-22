@@ -111,8 +111,10 @@ in {
         {
           provider =
             {
-              kind = optional (types.enum ["openrouter"]) ''
-                Provider implementation. t8ful currently supports `openrouter` only.
+              kind = optional (types.enum ["openrouter" "opencode-go"]) ''
+                Provider a bare, unresolvable model id defaults to. `openrouter`
+                and `opencode-go` are both supported, and both catalogs are listed
+                together; this only decides where an ambiguous id goes.
               '';
               model = optional types.str ''
                 Default model identifier, for example `anthropic/claude-sonnet-4`.
@@ -272,8 +274,8 @@ in {
     description = ''
       Non-secret settings written to t8ful's `config.toml`. Unset options are not
       written at all, so lower-priority configuration layers keep their values.
-      Credentials are never written: set `OPENROUTER_API_KEY` in the
-      environment instead.
+      Credentials are never written: set `OPENROUTER_API_KEY` and/or
+      `OPENCODE_GO_API_KEY` in the environment instead.
     '';
   };
 }

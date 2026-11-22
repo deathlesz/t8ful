@@ -346,6 +346,14 @@ impl ImagePreviews {
 
 /// The largest cell rectangle that preserves the image's pixel aspect ratio
 /// inside `max_columns` by `max_rows`.
+///
+/// This mirrors `ratatui_image`'s own sizing exactly, because the rows reserved
+/// here are the rows the renderer will paint into. Its `Resize::Fit` first
+/// clamps the target pixel box to the image's own pixel size and then fits the
+/// image inside that box by rounding, so a small image or a panorama occupies
+/// fewer cells than the box allows. Computing the box any other way reserves
+/// cells nothing draws: blank columns to the right of a cropped image, and blank
+/// rows under a short one.
 pub fn fit_preview(
     width: u32,
     height: u32,
@@ -357,22 +365,35 @@ pub fn fit_preview(
         return (1, 1);
     }
 
-    let font_width = f64::from(font.0.max(1));
-    let font_height = f64::from(font.1.max(1));
-    let image_aspect = (f64::from(width) * font_height) / (f64::from(height) * font_width);
-    let max_columns = f64::from(max_columns);
-    let max_rows = f64::from(max_rows);
-    let mut columns = max_columns;
-    let mut rows = columns / image_aspect;
+    let font_width = u32::from(font.0.max(1));
+    let font_height = u32::from(font.1.max(1));
+    let box_width = u32::from(max_columns) * font_width;
+    let box_height = u32::from(max_rows) * font_height;
 
-    if rows > max_rows {
-        rows = max_rows;
-        columns = rows * image_aspect;
-    }
+    // `Resize::Fit` never scales an image up, so the target box is clamped to
+    // the image's own pixels before fitting.
+    let (pixels_width, pixels_height) =
+        fit_proportionally(width, height, box_width.min(width), box_height.min(height));
+    let columns = pixels_width.div_ceil(font_width).max(1);
+    let rows = pixels_height.div_ceil(font_height).max(1);
 
     (
-        (columns.ceil() as u16).clamp(1, max_columns as u16),
-        (rows.ceil() as u16).clamp(1, max_rows as u16),
+        u16::try_from(columns).unwrap_or(u16::MAX).min(max_columns),
+        u16::try_from(rows).unwrap_or(u16::MAX).min(max_rows),
+    )
+}
+
+/// The pixel size an image takes when fitted inside a pixel box.
+///
+/// Same rounding as `ratatui_image`'s helper, so the cell size derived from it
+/// matches what it will encode.
+fn fit_proportionally(width: u32, height: u32, box_width: u32, box_height: u32) -> (u32, u32) {
+    let ratio =
+        (f64::from(box_width) / f64::from(width)).min(f64::from(box_height) / f64::from(height));
+
+    (
+        ((f64::from(width) * ratio).round() as u32).max(1),
+        ((f64::from(height) * ratio).round() as u32).max(1),
     )
 }
 
@@ -489,22 +510,55 @@ mod tests {
 
     #[test]
     fn previews_fit_the_cell_box_without_changing_aspect() {
+        // The reserved rectangle is what the renderer paints into, so these are
+        // ratatui-image's own numbers for a 10x20 font in a 100x24 cell box.
         assert_eq!(
             fit_preview(100, 100, (10, 20), MAX_PREVIEW_COLUMNS, MAX_PREVIEW_ROWS),
-            (48, 24)
+            (10, 5)
         );
         assert_eq!(
             fit_preview(100, 10, (10, 20), MAX_PREVIEW_COLUMNS, MAX_PREVIEW_ROWS),
-            (100, 5)
+            (10, 1)
         );
         assert_eq!(
             fit_preview(10, 100, (10, 20), MAX_PREVIEW_COLUMNS, MAX_PREVIEW_ROWS),
-            (5, 24)
+            (1, 5)
         );
         assert_eq!(
             fit_preview(0, 0, (10, 20), MAX_PREVIEW_COLUMNS, MAX_PREVIEW_ROWS),
             (1, 1)
         );
+    }
+
+    #[test]
+    fn the_reserved_rectangle_matches_what_the_renderer_paints() {
+        // A regression guard with the two real screenshots that exposed the bug.
+        // The old formula reserved the whole cell box and let the renderer scale
+        // down inside it, which left 42 blank columns and 6 blank rows under a
+        // 573x152 image.
+        for (width, height) in [(573, 152), (1850, 292), (640, 480), (48, 32)] {
+            let (columns, rows) = fit_preview(
+                width,
+                height,
+                (10, 20),
+                MAX_PREVIEW_COLUMNS,
+                MAX_PREVIEW_ROWS,
+            );
+            let protocol = Picker::halfblocks()
+                .new_protocol(
+                    image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height)),
+                    ratatui::layout::Size::new(columns, rows),
+                    ratatui_image::Resize::Fit(None),
+                )
+                .expect("protocol");
+            let painted = protocol.size();
+
+            assert_eq!(
+                (u32::from(painted.width), u32::from(painted.height)),
+                (u32::from(columns), u32::from(rows)),
+                "{width}x{height} reserves {columns}x{rows} but paints {painted:?}"
+            );
+        }
     }
 
     #[test]

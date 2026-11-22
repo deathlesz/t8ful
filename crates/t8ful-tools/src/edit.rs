@@ -193,6 +193,7 @@ impl Tool for EditFileTool {
                 "replacements": replacement_count,
                 "bytes": updated.len(),
             })),
+            images: Vec::new(),
         })
     }
 }

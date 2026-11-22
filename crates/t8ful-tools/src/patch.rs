@@ -162,6 +162,7 @@ impl Tool for ApplyPatchTool {
                     .map(|(path, bytes)| json!({ "path": path, "bytes": bytes }))
                     .collect::<Vec<_>>(),
             })),
+            images: Vec::new(),
         })
     }
 }

@@ -1,6 +1,6 @@
 # t8ful Design
 
-Authoritative behavior specification for t8ful 1.0.0: interfaces, policies, rationale, and explicit limits.
+Authoritative behavior specification for t8ful 1.1.1: interfaces, policies, rationale, and explicit limits.
 
 - User guide: [README.md](../README.md)
 - NixOS & Home Manager modules: [nix-modules.md](nix-modules.md)
@@ -14,7 +14,7 @@ Sections D01–D03 cover scope and architecture, D04–D07 interfaces and coding
 
 - **Interfaces:** A responsive full-screen TUI and a headless CLI, built as a Rust Cargo workspace.
 - **Platforms:** Linux-first. Core traits stay portable for future Windows/macOS support; Linux-specific sandbox code stays behind a platform boundary.
-- **Provider:** OpenRouter is the only initial provider, behind a provider interface designed to support others later.
+- **Providers:** OpenRouter and OpenCode Go, both behind one provider interface. Their catalogs are merged, and the selected model decides which endpoint a request goes to (D05).
 - **No plugin system:** External tools integrate over MCP; skills are instructions and supporting files, not code loaded into t8ful.
 - **Performance vs. closure size:** Responsiveness and usefulness take priority over minimizing the Nix closure. Avoid needless memory or binary bloat, and measure before optimizing.
 
@@ -35,14 +35,14 @@ Sections D01–D03 cover scope and architecture, D04–D07 interfaces and coding
 Config files use TOML. Precedence (highest first):
 
 1. CLI flags
-2. Environment variables (`OPENROUTER_API_KEY`, `T8FUL_MODEL`, `T8FUL_MODE`, `T8FUL_BASE_URL`, …)
+2. Environment variables (`OPENROUTER_API_KEY`, `OPENCODE_GO_API_KEY`, `T8FUL_MODEL`, `T8FUL_MODE`, `T8FUL_BASE_URL`, …)
 3. Explicit `--config <path>`
 4. Project (`<project-root>/.t8ful/config.toml`)
 5. User (`$XDG_CONFIG_HOME/t8ful/config.toml`, default `~/.config/t8ful`)
 6. System (`/etc/xdg/t8ful/config.toml`)
 7. Built-in defaults
 
-API keys live in `OPENROUTER_API_KEY` or `auth.json` (D05), and MCP tokens in environment variables or an external secret manager — never in Nix-generated config.
+API keys live in `OPENROUTER_API_KEY` / `OPENCODE_GO_API_KEY` or `auth.json` (D05), and MCP tokens in environment variables or an external secret manager — never in Nix-generated config.
 
 ### Authority-granting settings and project trust
 
@@ -75,7 +75,9 @@ Coding mode is autonomous and has no approval gate. `[approval]` produces the st
 | Crate | Responsibility |
 | --- | --- |
 | `t8ful-core` | Conversation/tool types, provider and tool traits, policy gate, agent loop, context budgeting, task graph, subagent orchestration, worktree interface, typed events. |
-| `t8ful-openrouter` | OpenRouter HTTP/model catalog, SSE streaming and fragmented tool-call assembly, usage and error mapping. |
+| `t8ful-openai` | OpenAI-compatible transport shared by both providers: SSE decoder, fragmented tool-call assembly, HTTP/TLS client, prompt serialization, usage and error mapping. |
+| `t8ful-openrouter` | OpenRouter catalog, attribution headers, and `reasoning` request shape. |
+| `t8ful-opencode` | OpenCode Go catalog, endpoints, `x-opencode-session` header, and `reasoning_effort` request shape. |
 | `t8ful-tools` | Built-in file, edit, patch, shell, managed-process, recall, task, and subagent tools. |
 | `t8ful-mcp` | MCP server lifecycle (`rmcp`), stdio & Streamable HTTP transports, `mcp__server__tool` naming, plan-mode trust, core `Tool` dispatch. |
 | `t8ful-sandbox` | Linux Bubblewrap planning sandbox behind the core sandbox interface. |
@@ -99,7 +101,7 @@ Coding mode is autonomous and has no approval gate. `[approval]` produces the st
 
 - Stream model output and tool output without blocking input or redraws. A tool card appears on dispatch, streams bounded live output, and is replaced by the final result.
 - **Incremental rendering:** Cache wrapped line ranges by entry revision, live-block generation, and width; redraw only when state changes, keeping idle CPU near zero. Live markdown and reasoning render block by block (completed blocks stay cached; unterminated fenced code renders unhighlighted until its closing fence arrives). Growing tool bodies wrap only newly arrived lines.
-- **Tool cards:** `bash` headers show the full wrapped command; other tools elide the path or first line to 60 characters. Collapsed cards show their last 4 body lines plus a count of earlier lines revealed by `Ctrl-O`; preview bodies show their first 5. Any card whose first content line reports a nonzero exit, timeout, signal, or cancellation shows the error glyph and never collapses (including after resume).
+- **Tool cards:** `bash` headers show the full wrapped command; other tools elide the path or first line to 60 characters. The five process tools keep separate labels (`Process output`, `Process status`, `Process list`, `Process wait`, `Process stop`) and title the card with the `process_id` they were given; an MCP server named `process` renders as `Process · output` and stays distinct. Collapsed cards show their last 4 body lines plus a count of earlier lines revealed by `Ctrl-O`; preview bodies show their first 5. Any card whose first content line reports a nonzero exit, timeout, signal, or cancellation shows the error glyph and never collapses (including after resume).
 
 ### Scrolling and clipboard
 
@@ -168,6 +170,8 @@ One Emacs-style editor powers the composer, model/session filters, login prompt,
 - Pending attachments sit in a compact tray above the composer (ordinal, format, dimensions, size). On `UserMessage` confirmation they move into the transcript with a caption and terminal preview capped at 100×24 cells.
 - Protocol preference: Kitty, Sixel, or iTerm2 (auto-detected; under tmux only when `TERM` starts with `tmux` or `TERM_PROGRAM=tmux` for passthrough), falling back to halfblocks. `T8FUL_IMAGE_PROTOCOL` (`kitty`, `sixel`, `iterm2`, `halfblocks`) overrides detection.
 - Lazy decoding on ≤2 workers with a 64 MiB per-image decoded cap and 64 MiB preview cache. Missing, corrupt, or oversized files keep their caption and show a preview-unavailable line. Resume restores metadata in place and never requeues submitted images.
+- `read_file` over a PNG, JPEG, WebP, or GIF returns the picture itself: the magic bytes decide, the file is copied into session storage through the same validation path an attachment uses, and the result carries the reference plus a caption (`shot.png · image/png · 1200x800 · 34 KiB`). A tool card renders that caption and preview under its body. Other binaries keep the not-UTF-8 error, and `start_line`/`byte_offset` still mean text.
+- A `tool` message is text on the wire, so the transport emits a result's images as one `user` message carrying `image_url` parts, placed after the whole tool-result batch. Never interleaved: every `role: "tool"` message must directly follow the assistant message holding its `tool_calls`.
 
 ### Headless CLI
 
@@ -175,13 +179,22 @@ One Emacs-style editor powers the composer, model/session filters, login prompt,
 
 ---
 
-## D05 — OpenRouter provider
+## D05 — Providers
 
-- **Credentials:** `OPENROUTER_API_KEY` always wins; otherwise t8ful reads `auth.json` in the state directory (owner-only, atomic write; malformed file is a startup error naming the path). Startup, `t8ful run`, and `t8ful models` share this resolution. Without credentials, the TUI starts unauthenticated (`not connected; run /login`, no catalog request) while headless runs fail early. Idle `/login` or `/logout` swaps the provider and compaction client, resets the catalog to pending, and cancels any in-flight catalog fetch.
-- **Extensibility:** A new provider implements the core provider interface without changing agent-loop or UI behavior.
-- **Models:** Headless runs require a configured model ID. The TUI defaults to `deepseek/deepseek-v4.1-flash-1017` when unset (OpenRouter exposes no default-model endpoint); `/model` switches at turn boundaries, and subagent roles can pick their own model.
-- **Streaming and validation:** Reassembles incremental text and fragmented tool-call IDs, names, and JSON arguments; validates complete calls before dispatch. Maps auth, rate-limit, transport, unsupported-model, and malformed-stream errors clearly. Never auto-replays executed tools after cancellation or stream failure. A text-only reply consisting solely of fabricated tool markup (`<tool_result>`, `<tool_call>`, `<function_call>`) is displayed with a warning and never treated as a tool result.
-- **Reasoning effort:** `default` omits the reasoning field; `off` sends `reasoning: { enabled: false }`; `minimal`, `low`, `medium`, `high`, `xhigh`, and `max` send `reasoning: { effort: <level> }`. Catalog `supported_parameters` / `supported_efforts` determine support; switching to a model without reasoning resets non-default effort to `default` with a warning, and the picker dims unsupported options.
+t8ful talks to two OpenAI-compatible providers: **OpenRouter** and **OpenCode Go**. Both are always compiled in, both clients can be live at once, and the model a turn uses decides where its request goes.
+
+- **Merged catalog.** `/model`, the picker, and `t8ful models` list every model from both catalogs, each tagged with the provider that serves it (`kimi-k3 [opencode-go]`, `vendor/sol [openrouter]`). `t8ful models` prints aligned `ID` / `PROVIDER` / `NAME` columns, and `t8ful models --json` reports the same `provider` field. One catalog failure is a warning, not an error: the other provider's models still load.
+- **Per-model routing.** A model id from the OpenRouter catalog goes to OpenRouter and an id from the Go catalog goes to OpenCode Go. An id both catalogs carry (for example `deepseek-v4.1-flash`) stays **two rows** with distinct labels, and the picker's choice pins the provider, so a Go subscriber reaches the Go copy. An id in neither catalog (hand-typed with `/model id`) goes to `provider.kind`, whose values are `openrouter` (the default) and `opencode-go`.
+- **OpenRouter endpoint:** `https://openrouter.ai/api/v1`, configurable with `provider.base_url` / `T8FUL_BASE_URL` under the trust rules. Every catalog and chat request carries the attribution headers `User-Agent: t8ful/<version>`, `HTTP-Referer: https://github.com/deathlesz/t8ful`, `X-OpenRouter-Title: t8ful`, and `X-OpenRouter-Categories: cli-agent`. **Privacy note:** the referer and title are public on OpenRouter's rankings, so t8ful appears there by name. Set `X-OpenRouter-App-Visibility: hidden` to opt out.
+- **OpenCode Go endpoints:** catalog `GET https://opencode.ai/inference/go/v1/models` (an anonymous request is accepted, so it works before login) and chat `POST https://opencode.ai/inference/go/openai/v1/chat/completions`. The base URL is fixed: there is no configuration surface for it. Every Go chat request sends `User-Agent: t8ful/<version>` and `x-opencode-session: ses_<session-id>`. Go **requires** the session header (a request without it is rejected) and also uses it to route prompt caching, so it stays stable for the life of a conversation and is restored on resume.
+- **Go abuse monitoring is OpenCode's, not t8ful's.** t8ful makes no claim about what a third-party endpoint does with a request beyond sending the headers above.
+- **Credentials:** `OPENROUTER_API_KEY` and `OPENCODE_GO_API_KEY` each win over the matching stored key in `auth.json` in the state directory (owner-only, atomic write, one entry per provider; a malformed file is a startup error naming the path). Saving or forgetting one provider leaves the other untouched. Startup, `t8ful run`, and `t8ful models` share this resolution. Without any credential the TUI starts unauthenticated (`not connected; run /login`, no catalog request) while headless runs fail early with `missing provider credentials: set OPENROUTER_API_KEY or OPENCODE_GO_API_KEY, or run /login`. With exactly one credential the session runs normally, that catalog's models are listed, and the missing provider is reported once. Idle `/login <provider>` or `/logout <provider>` rebuilds the affected client, resets the catalog to pending, and cancels any in-flight catalog fetch.
+- **Shared protocol, separate providers.** The SSE decoder, fragmented-tool-call assembler, HTTP/TLS client, prompt serialization, and error mapping live in `t8ful-openai`; each provider supplies only its endpoints, headers, catalog shape, and request-body spelling. Go requests use `stream_options.include_usage` and a flat `reasoning_effort`; OpenRouter requests use `usage.include` and a `reasoning` object. Go's `opencode.tokens.*` usage block is a fallback for any OpenAI token field that is absent.
+- **Extensibility:** The binary's routing façade composes both clients behind the one core provider interface, so the agent loop and every frontend stay provider-agnostic and adding another provider does not touch either.
+- **Models:** Headless runs require a configured model ID. The TUI defaults to `deepseek/deepseek-v4.1-flash-1017` when unset; `/model` switches at turn boundaries, and subagent roles can pick their own model.
+- **Streaming and validation:** Reassembles incremental text and fragmented tool-call IDs, names, and JSON arguments; validates complete calls before dispatch. Maps auth, rate-limit, payment-required, transport, unsupported-model, and malformed-stream errors clearly. Never auto-replays executed tools after cancellation or stream failure. A text-only reply consisting solely of fabricated tool markup (`<tool_result>`, `<tool_call>`, `<function_call>`) is displayed with a warning and never treated as a tool result.
+- **`Retry-After` is honoured, once, before generation.** A rejected request (429, or 402 for OpenRouter's `openrouter_in_flight_budget` only) with a delta-seconds `Retry-After` at or under 120 s is re-sent, at most 5 attempts, each retry announced by one warning (`rate limited by the provider; retry 2/5 in 12s`). The body is rebuilt from the one request shape, nothing has been billed, and the wait is dropped the moment the consumer drops the stream. A refusal that waiting cannot clear — `openrouter_credits`, `openrouter_key_limit`, an unknown source, an absent or over-cap header — is reported with the provider's own `limit_source` instead of retried. A failure partway through a stream is never retried: the deltas already reached the consumer and the usage bookkeeping is already committed.
+- **Reasoning effort:** On OpenRouter, `default` omits the reasoning field; `off` sends `reasoning: { enabled: false }`; `minimal`, `low`, `medium`, `high`, `xhigh`, and `max` send `reasoning: { effort: <level> }`. On Go, `default` and `off` omit the field and the levels send `reasoning_effort: <level>`. Catalog metadata (`supported_parameters` / `supported_efforts` on OpenRouter, `capabilities.reasoning.effort` on Go) determines support; switching to a model without reasoning resets non-default effort to `default` with a warning, and the picker dims unsupported options.
 
 ---
 
@@ -189,7 +202,7 @@ One Emacs-style editor powers the composer, model/session filters, login prompt,
 
 | Capability | Behavior |
 | --- | --- |
-| `read_file` | Bounded file reads; reports missing paths and truncation. |
+| `read_file` | Bounded file reads; reports missing paths and truncation. A PNG, JPEG, WebP, or GIF comes back as an image the model can see (D04). |
 | `write_file` | Create or deliberately overwrite files (autonomous in coding mode, inside or outside project root). |
 | `edit_file` | Atomic multi-block exact-text replacement against original content; fails unchanged on missing, ambiguous, or overlapping matches. |
 | `apply_patch` | Validated unified patch application; reports conflicts without silent overwrites. |
@@ -217,21 +230,21 @@ There is no dedicated file-search or web tool — use `rg`/`grep` via `bash` or 
 
 - **Coding mode is autonomous.** All tool effects — writes anywhere, destructive shell or Git commands, package changes — run with the user's privileges and no sandbox, approval prompt, classifier, or grant. The user controls blast radius through mode, launch environment, and project choice.
 - **Plan mode is the boundary.** It denies mutating tool effects and sandboxes shell commands (D08). Direct reads stay unrestricted in both modes. Nothing (model, instructions, skills, subagents, config, or MCP) can disable plan-mode restrictions.
-- **Credentials:** `auth.json` is the only non-env API key store; it is never a Nix build input and never enters logs, journals, transcripts, or shell environments. Never intentionally log secret configuration or authorization headers. General shell commands strip `OPENROUTER_API_KEY` and all configured MCP credential env vars. In coding mode, MCP servers receive only their own configured vars; in plan mode, local MCP servers receive none. Env filtering is accidental-leak reduction, **not** a security boundary for unsandboxed coding commands.
+- **Credentials:** `auth.json` is the only non-env API key store; it is never a Nix build input and never enters logs, journals, transcripts, or shell environments. Never intentionally log secret configuration or authorization headers. General shell commands strip `OPENROUTER_API_KEY`, `OPENCODE_GO_API_KEY`, and all configured MCP credential env vars. In coding mode, MCP servers receive only their own configured vars; in plan mode, local MCP servers receive none. Env filtering is accidental-leak reduction, **not** a security boundary for unsandboxed coding commands.
 - **Shared workspaces:** Concurrent agents in a shared workspace can overwrite each other's files or shell state. Attribution and tasks reduce confusion but do not prevent conflicts.
 
 ---
 
 ## D08 — Plan mode and local isolation
 
-Plan mode is an explicit user mode for exploration, structured questions, and presenting a plan. Local file tools, shell commands, and local MCP servers cannot write project files or host files; saving a plan to disk requires switching to coding mode. Necessary host exceptions are session/usage storage, OpenRouter requests, and explicitly trusted remote MCP servers (whose remote side effects cannot be locally sandboxed).
+Plan mode is an explicit user mode for exploration, structured questions, and presenting a plan. Local file tools, shell commands, and local MCP servers cannot write project files or host files; saving a plan to disk requires switching to coding mode. Necessary host exceptions are session/usage storage, provider requests, and explicitly trusted remote MCP servers (whose remote side effects cannot be locally sandboxed).
 
 - **Authoritative mode:** The current request's `<plan_mode>` block governs that request; earlier environment blocks in the transcript are historical. `present_plan` submits a proposal for review and does not switch modes or authorize implementation.
 - **Direct reads:** Unconfined in both modes — the model can read anything the t8ful process can read. Plan mode protects against writes and network access, not read confidentiality.
 - **Sandbox posture ("read the whole host, write nothing"):**
   - Host `/` and every nested submount are individually bound read-only (a recursive bind does not make nested mounts read-only).
   - Only a private, disposable `/tmp` and `/var/tmp` are writable; read-scope roots are re-bound read-only afterwards so projects under `/tmp` remain readable.
-  - Environment is reduced to `PATH`, `HOME`, `LANG`, `LC_*`, `TZ`, plus non-denied extras, passed via `execve` (never `--setenv`, keeping values out of `/proc/<pid>/cmdline`). `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY`, `DISPLAY`, `NIX_REMOTE`, and `OPENROUTER_API_KEY` are always dropped.
+  - Environment is reduced to `PATH`, `HOME`, `LANG`, `LC_*`, `TZ`, plus non-denied extras, passed via `execve` (never `--setenv`, keeping values out of `/proc/<pid>/cmdline`). `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY`, `DISPLAY`, `NIX_REMOTE`, `OPENROUTER_API_KEY`, and `OPENCODE_GO_API_KEY` are always dropped.
   - Network namespace is unshared, and a seccomp filter denies `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept`, `accept4`, and `io_uring_setup`.
   - Writes to `~`, `/etc`, `/nix/store`, `/var`, or `/run` fail with `EROFS`, and remounting fails.
 - **Tradeoff:** Because the host is readable, sandboxed commands can read SSH keys, cloud credentials, `auth.json`, and `/nix/store`. Never put secrets in the Nix store.
@@ -266,7 +279,7 @@ t8ful supports local stdio and remote Streamable HTTP MCP **tools** via `rmcp` 3
   - Local servers run inside the Bubblewrap sandbox with `pass_env` withheld. Launchers like `npx` usually fail without network/writable paths; the error explains this and suggests configuring `url`. Without a sandbox, local servers do not start in plan mode (no fallback).
   - Remote servers run in plan mode only if configured with `plan = "read-only"` (`ToolEffect::ReadOnly`); otherwise they report `Mutating` and the policy gate denies calls via `Tool::denial_reason` naming the setting. The registry and prompt stay identical across modes. There is no per-call approval gate — trusting a remote server for plan mode accepts its remote side-effect risk.
 - **Results & errors:** Walks `content` in order (text verbatim, image/audio as size+type placeholders, resource links as URIs, `structuredContent` as JSON only when no content block produced text). `isError` marks tool failure; output truncates to `shell.max_output_bytes`. Arguments are validated as a JSON object (deeper checks are the server's job). Cancelled calls are reported indeterminate and never replayed. Servers requiring interactive OAuth fail naming `bearer_token_env`.
-- **Out of scope for 1.0.0:** MCP resources, prompts, sampling, elicitation, tasks, legacy HTTP/SSE transport, and interactive OAuth.
+- **Out of scope for 1.1.1:** MCP resources, prompts, sampling, elicitation, tasks, legacy HTTP/SSE transport, and interactive OAuth.
 
 ---
 
@@ -278,7 +291,7 @@ t8ful supports local stdio and remote Streamable HTTP MCP **tools** via `rmcp` 3
 - **Listing:** `/sessions`, `/resume`, and `t8ful sessions` show only sessions containing at least one user prompt (excluding mode-only, attachment-only, or skill-only journals), ordered newest-first by latest message age (falling back to file mtime, then header).
 - **Durability & recovery:** Writes are serialized and guarded against concurrent writers. Incomplete trailing records recover without replaying actions; malformed earlier records are reported rather than silently dropped; crashes leaving a tool outcome unknown are reported as ambiguous and never replayed.
 - **`recall` tool:** Searches prior journals on demand — user prompts and assistant text only (never tool calls/results, skill wrappers, or the current session). Default scope is the current canonical project root; `scope = "all"` searches every project. No index and no LLM call inside the tool: returns ranked excerpts (session ID, age, mode, title, role). Budget: newest-first scan of up to 200 journals, 2 MiB per journal, 32 MiB total (reports how many older sessions were skipped; skips malformed lines). Journaling a `recall` call records only the query and returned excerpts.
-- **Compaction:** Resolves model limits from the OpenRouter catalog (including vendor-prefixed IDs), overridden by `agent.context_limit`. Uses the latest provider usage as baseline and estimates only subsequent messages. Triggers when estimated tokens + 16,384 reserve ≥ limit, keeping ~20,000 recent tokens verbatim and cutting at user/assistant boundaries (both budgets scale proportionally on small windows so compaction never disables itself; split turns summarize an ordered prefix). Compaction and context-limit errors are reported rather than silently dropping history.
+- **Compaction:** Resolves model limits from the merged provider catalog (including vendor-prefixed IDs), overridden by `agent.context_limit`. Uses the latest provider usage as baseline and estimates only subsequent messages. Triggers when estimated tokens + 16,384 reserve ≥ limit, keeping ~20,000 recent tokens verbatim and cutting at user/assistant boundaries (both budgets scale proportionally on small windows so compaction never disables itself; split turns summarize an ordered prefix). Compaction and context-limit errors are reported rather than silently dropping history.
 - **Usage:** Tracks input/output tokens and cost per request, session, model, and subagent (including compaction), plus cross-session totals. Deduplicates repeated records for the same provider generation while keeping distinct billable attempts. Missing values are marked unknown/partial, never zero.
 
 ---
@@ -298,6 +311,7 @@ t8ful supports local stdio and remote Streamable HTTP MCP **tools** via `rmcp` 3
 - **Roles and tools:** Global, project, or ad hoc roles define instructions, allowed tools, optional model, and default isolation. Empty `tools` inherits all parent tools minus excluded ones; a named list is intersected with the parent's tools (a child never gains tools the parent lacks). Children are always single-level: `spawn_agents`, `agent_wait`, `agent_status`, `ask_user_question`, and `present_plan` are always excluded, and children have no question router. Children run in separate contexts and inherit the parent's plan mode and sandbox. A role with `bash` is not a read-only boundary.
 - **Non-blocking execution & notices:** `spawn_agents` returns immediately. When a child stops, its report goes onto the parent's notice queue (separate from steering, which waits for the current step's tool calls). Reports deliver exactly once at a turn boundary: waking an idle parent when `agents.wake_on_finish` is enabled (configurable because it spends money unattended), or immediately before the next prompt otherwise. `agent_wait` consumes notices for the reports it returns. Switching sessions cancels and forgets all children and drains agent and process notices so nothing leaks into the new session.
 - **Notice framing:** Notices are delivered as user-role messages (no synthetic tool-call ID). Free-text report fields and process output tails are escaped so they cannot forge closing tags, agent summaries truncate at 8,000 bytes with a note, and resume renders notices as informational rows rather than user prompts. The user-role envelope is a documented limitation, not an authorization input.
+- **Notice rendering on resume:** The journal and the provider request keep the envelope unchanged; only the display decodes it. A restored informational row that parses as a notice is drawn as a card (process id or agent id, state, exit code/signal, elapsed time, size, command and output tail), decoded and drawn as a card, never the raw envelope. Anything that does not parse stays a plain informational row.
 - **Limits & accounting:** Defaults are 4 concurrent children and 16 spawns per root turn (both configurable). `agents.max_depth` is parsed for backwards compatibility and ignored with a warning. Each child writes its own journal, with usage attributed in the shared ledger and its report.
 
 ---
@@ -316,7 +330,7 @@ t8ful supports local stdio and remote Streamable HTTP MCP **tools** via `rmcp` 3
 - **Nix:** Exposes a `t8ful` package (`nix build`/`nix run`) plus NixOS and Home Manager modules compatible with writable user skills. Do not assume Nix on future platforms; in coding mode on Nix systems, `nix shell nixpkgs#<package> -c <command>` can supply missing tools.
 - **Performance:** Measure optimized builds on target hardware: warm TUI startup, input-to-render p50/p95 under streaming, idle/peak memory, and binary size. Keep Nix evaluation and network/model latency separate. Establish baselines before setting numeric budgets, and investigate regressions rather than cutting features for closure size.
 - **Micro-benchmarks:** `divan` benches (`cargo bench`) cover a 20 KB streamed markdown delta, a 256 KB appended tool body, a mention keypress over a large tree, and an 8 KB prompt. They are a change signal, not a CI gate.
-- **Testing:** Deterministic unit and integration tests using fake provider streams, loopback/stdio MCP servers, temp Git repos, fake clipboards, and controlled processes. No network or paid OpenRouter calls; live smoke tests require explicit authorization.
+- **Testing:** Deterministic unit and integration tests using fake provider streams, loopback/stdio MCP servers, temp Git repos, fake clipboards, and controlled processes. No network or paid provider calls; live smoke tests require explicit authorization.
 
 ---
 
@@ -329,10 +343,10 @@ Any change that weakens an enforced property, or quietly claims a non-guarantee,
 - **Project authority requires trust:** `provider.base_url`, `skills.paths`, `ui.notify_command`, `[mcp.servers.*]`, and `agent.mode = "coding"` from a project file apply only after user trust, bound to the config file's SHA-256 hash.
 - **Plan mode cannot mutate local state:** File tools, the policy gate, and Bubblewrap block project and host writes, network access, and host sockets.
 - **Plan mode fails closed:** If the sandbox cannot start, planning shells and local plan-mode MCP servers error rather than running unsandboxed.
-- **No replay on doubt:** Journals record dispatch intents and results; indeterminate tool outcomes are reported, never retried automatically.
+- **No replay on doubt:** Journals record dispatch intents and results; indeterminate tool outcomes are reported, never retried automatically. A provider retry is not a tool replay: the rejected request never generated anything, and nothing was dispatched or journaled as executed.
 - **Children cannot escalate:** Child tools are role ∩ parent minus delegation and user-interaction tools, inheriting the parent's mode and sandbox.
 - **Child work is never merged:** Isolated worktrees and branches are reported and preserved for the user to integrate.
-- **Credentials stay out of config:** MCP credentials are env var names only; OpenRouter keys come from `OPENROUTER_API_KEY` or owner-only `auth.json` and are never printed, logged, journaled, or placed in Nix build inputs.
+- **Credentials stay out of config:** MCP credentials are env var names only; provider keys come from `OPENROUTER_API_KEY` / `OPENCODE_GO_API_KEY` or owner-only `auth.json` and are never printed, logged, journaled, or placed in Nix build inputs.
 - **Restricted layers cannot widen policy:** System config never grants authority, and an untrusted project can at most tighten to plan mode.
 
 ### Not guaranteed
@@ -343,5 +357,5 @@ Any change that weakens an enforced property, or quietly claims a non-guarantee,
 - **Remote MCP side effects cannot be enforced:** A remote server trusted for plan mode can do whatever its remote API allows.
 - **Credential filtering is not isolation:** Stripping known env vars from shells only reduces accidental leaks.
 - **Shared-workspace subagents can conflict:** Concurrent writers can overwrite each other's files and shell state.
-- **Sandbox isolation is not kernel-exploit immunity:** Nor does it protect data already sent to OpenRouter.
+- **Sandbox isolation is not kernel-exploit immunity:** Nor does it protect data already sent to a provider.
 - **Estimates are estimates:** Context budgets and usage totals can be partial; unknown values are reported as unknown rather than invented.

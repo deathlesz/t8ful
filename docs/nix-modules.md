@@ -136,7 +136,7 @@ Pair write-capable roles with `isolation = "worktree"` to give the child its own
 
 ## Credentials
 
-Because the Nix store is world-readable, never put API keys or tokens in `programs.t8ful.settings`, `home.sessionVariables`, or any Nix-managed file. Provide `OPENROUTER_API_KEY` in the runtime environment (shell profile, `direnv`, or a runtime secret manager) or save it interactively with `/login`.
+Because the Nix store is world-readable, never put API keys or tokens in `programs.t8ful.settings`, `home.sessionVariables`, or any Nix-managed file. Provide `OPENROUTER_API_KEY` and/or `OPENCODE_GO_API_KEY` in the runtime environment (shell profile, `direnv`, or a runtime secret manager) or save them interactively with `/login openrouter` and `/login opencode-go`.
 
 ## Project trust
 

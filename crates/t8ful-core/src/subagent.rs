@@ -258,6 +258,43 @@ pub fn escape_inline(text: &str) -> String {
     escaped
 }
 
+/// Inverse of [`escape_inline`]: turn a rendered notice field back into the
+/// text a person should read.
+///
+/// `&amp;` is expanded last so `&amp;lt;` — an escaped ampersand followed by the
+/// letters `lt` — comes back as `&lt;` instead of being read as `<`.
+pub fn unescape_inline(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_owned();
+    }
+
+    let mut unescaped = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(index) = rest.find('&') {
+        unescaped.push_str(&rest[..index]);
+
+        let tail = &rest[index..];
+
+        if let Some(remainder) = tail.strip_prefix("&lt;") {
+            unescaped.push('<');
+            rest = remainder;
+        } else if let Some(remainder) = tail.strip_prefix("&gt;") {
+            unescaped.push('>');
+            rest = remainder;
+        } else if let Some(remainder) = tail.strip_prefix("&amp;") {
+            unescaped.push('&');
+            rest = remainder;
+        } else {
+            unescaped.push('&');
+            rest = &tail[1..];
+        }
+    }
+
+    unescaped.push_str(rest);
+    unescaped
+}
+
 /// Longest child summary carried inside an agent notice, in bytes.
 pub const AGENT_NOTICE_SUMMARY_BYTES: usize = 8_000;
 
@@ -941,7 +978,7 @@ mod tests {
     use super::{
         AGENT_NOTICE_SUMMARY_BYTES, AgentId, AgentLimits, AgentNotice, AgentRegistry, AgentReport,
         ChildStatus, Isolation, Mode, NoticeQueue, ReasoningEffort, RoleProfile, SpawnRequest,
-        Worktree,
+        Worktree, escape_inline, unescape_inline,
     };
     use crate::task::TaskId;
     use crate::usage::Usage;
@@ -1299,6 +1336,24 @@ mod tests {
             registry.notices_for(&parent).is_empty(),
             "a late finish repopulated the abandoned queue"
         );
+    }
+
+    #[test]
+    fn unescaping_a_notice_field_round_trips_escaping_it() {
+        for text in [
+            "cd /work && cargo test 2>&1 | tail -5",
+            "a < b > c",
+            "&amp;lt; is not <",
+            "& alone and &unknown; too",
+            "plain text",
+            "",
+        ] {
+            assert_eq!(unescape_inline(&escape_inline(text)), text);
+        }
+
+        // `&amp;lt;` is an escaped ampersand followed by `lt`, not a `<`.
+        assert_eq!(unescape_inline("&amp;lt;"), "&lt;");
+        assert_eq!(unescape_inline("&lt;"), "<");
     }
 
     #[test]

@@ -192,6 +192,7 @@ impl Tool for AskUserQuestionTool {
                     content: rendered,
                     truncated: false,
                     metadata: Some(json!({ "answered": answers.len() })),
+                    images: Vec::new(),
                 })
             }
             QuestionOutcome::Unavailable(reason) => Err(ToolError::InputRequired(format!(

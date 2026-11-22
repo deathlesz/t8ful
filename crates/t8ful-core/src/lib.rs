@@ -43,7 +43,10 @@ pub use journal::{
     AgentJournal, CompactionRecord, JournalError, ModelAttempt, NullJournal, UsageRecord,
 };
 pub use message::{Conversation, Message, Role};
-pub use notice::{Notice, ProcessNotice};
+pub use notice::{
+    AgentNoticeRow, Notice, NoticeRow, PROCESS_NOTICE_TAIL, ProcessNotice, ProcessNoticeRow,
+    parse_notice,
+};
 pub use policy::{Decision, Mode, Policy};
 pub use provider::{
     FinishReason, ModelInfo, Provider, ProviderEvent, ProviderRequest, ProviderStream,

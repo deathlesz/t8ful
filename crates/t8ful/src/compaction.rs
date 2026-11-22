@@ -29,11 +29,32 @@ tools and do not invent facts from the missing part of the conversation.";
 
 pub struct ModelCompactor {
     provider: Arc<dyn Provider>,
+    /// The conversation a summary belongs to, for providers that need one on the
+    /// wire. Shared so a session switch updates the compactor without a rebuild.
+    session_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ModelCompactor {
     pub fn new(provider: Arc<dyn Provider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            session_id: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Point summaries at the conversation they belong to.
+    pub fn set_session_id(&self, session_id: Option<String>) {
+        *self
+            .session_id
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = session_id;
+    }
+
+    fn current_session_id(&self) -> Option<String> {
+        self.session_id
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 }
 
@@ -89,6 +110,7 @@ impl ContextCompactor for ModelCompactor {
                 max_output_tokens: limits.max_output_tokens,
                 reasoning: ReasoningEffort::Default,
                 reasoning_value: None,
+                session_id: self.current_session_id(),
             };
             let mut stream = self.provider.stream(request);
             let mut text = String::new();
@@ -107,6 +129,9 @@ impl ContextCompactor for ModelCompactor {
 
                 match item {
                     Ok(ProviderEvent::ReasoningDelta(_)) => {}
+                    // A retry notice from the transport has no place in a
+                    // summary; the compaction either completes or fails.
+                    Ok(ProviderEvent::Warning(_)) => {}
                     Ok(ProviderEvent::TextDelta(delta)) => text.push_str(&delta),
                     Ok(ProviderEvent::Usage(usage)) => {
                         usages.push(UsageRecord {
@@ -230,6 +255,18 @@ fn view_message(message: &Message) -> String {
                     status_label(result.status),
                     result.content
                 ));
+
+                // The summary is text only, so an image the result carried is
+                // named the same way an inline one is.
+                for image in &result.images {
+                    rendered.push_str(&format!(
+                        "[image attachment {} {}x{}: {}]\n",
+                        image.media_type,
+                        image.width,
+                        image.height,
+                        image.path.display()
+                    ));
+                }
             }
         }
     }

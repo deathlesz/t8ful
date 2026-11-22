@@ -77,6 +77,14 @@ impl Message {
             .any(|content| content.as_image().is_some())
     }
 
+    /// Whether this message contributes an image to the request at all.
+    ///
+    /// A tool result's images are hoisted into a user message by the transport,
+    /// so they count here even though the message itself is `Role::Tool`.
+    pub fn carries_images(&self) -> bool {
+        self.has_images() || self.results().any(|result| !result.images.is_empty())
+    }
+
     pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
         self.content.iter().filter_map(Content::as_tool_call)
     }
@@ -153,5 +161,42 @@ impl Conversation {
             .flat_map(Message::tool_calls)
             .filter(|call| !answered.contains(&call.id.as_str()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::content::ImageInput;
+    use crate::tool::{ToolCall, ToolResult, ToolStatus};
+
+    use super::Message;
+
+    fn image() -> ImageInput {
+        ImageInput::new("image/png", PathBuf::from("/state/shot.png"), 40, 30, 64)
+    }
+
+    #[test]
+    fn a_tool_result_image_counts_as_an_image_the_request_carries() {
+        // `has_images` asks what the message itself holds; the request also
+        // carries whatever a result returned, so the capability guard has to
+        // use the wider question.
+        let call = ToolCall::new("call-1", "read_file", serde_json::json!({}));
+        let plain = Message::tool_results([ToolResult::new(&call, ToolStatus::Ok, "a.txt", false)]);
+        let with_image =
+            Message::tool_results([ToolResult::new(&call, ToolStatus::Ok, "shot.png", false)
+                .with_images(vec![image()])]);
+
+        assert!(!plain.has_images());
+        assert!(!plain.carries_images());
+        assert!(!with_image.has_images());
+        assert!(with_image.carries_images());
+
+        // A user attachment still counts both ways.
+        let submitted = Message::user_with_images(None, vec![image()]);
+
+        assert!(submitted.has_images());
+        assert!(submitted.carries_images());
     }
 }

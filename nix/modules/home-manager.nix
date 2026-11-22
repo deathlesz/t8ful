@@ -2,7 +2,8 @@
 #
 # Writes the user layer: `$XDG_CONFIG_HOME/t8ful/config.toml` and one link per
 # pinned skill under `$XDG_CONFIG_HOME/t8ful/skills`. Credentials are never
-# written; t8ful reads `OPENROUTER_API_KEY` from the environment.
+# written; t8ful reads `OPENROUTER_API_KEY` and `OPENCODE_GO_API_KEY` from
+# the environment.
 {self}: {
   config,
   lib,

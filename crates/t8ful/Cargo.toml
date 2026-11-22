@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 t8ful-core.workspace = true
 t8ful-openrouter.workspace = true
+t8ful-openai.workspace = true
+t8ful-opencode.workspace = true
 t8ful-tools.workspace = true
 t8ful-tui.workspace = true
 t8ful-sandbox.workspace = true

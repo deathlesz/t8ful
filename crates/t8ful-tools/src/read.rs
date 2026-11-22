@@ -1,22 +1,33 @@
-//! Bounded, UTF-8-safe file reading.
+//! Bounded, UTF-8-safe file reading, and image reading.
 //!
 //! Line ranges keep their 1-based inclusive behavior. A byte offset reads a
 //! bounded window for files that are one enormous line, where line ranges
-//! cannot make progress.
+//! cannot make progress. A PNG, JPEG, WebP, or GIF is recognized from its magic
+//! bytes and returned as an image reference instead of text, because a
+//! chat-completions tool message cannot carry pixels.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use t8ful_core::tool::{Tool, ToolCall, ToolContext, ToolEffect, ToolError, ToolOutput, ToolSpec};
 
+use crate::attachments::{AttachmentStore, caption, encoded_size, image_magic, sniff_image};
 use crate::paths;
 
 pub const MAX_LINES: usize = 2000;
 pub const MAX_BYTES: usize = 50 * 1024;
+
+/// Bytes read to recognize an image before the text path opens the file.
+///
+/// Every container states its dimensions in a leading header, but a JPEG may
+/// carry a large EXIF/ICC segment before its frame header, so the window is
+/// generous rather than minimal.
+const SNIFF_BYTES: usize = 64 * 1024;
 
 /// Bytes one line may occupy before line mode gives up on it.
 ///
@@ -36,8 +47,16 @@ struct ReadArgs {
     byte_offset: Option<usize>,
 }
 
-#[derive(Debug, Default)]
-pub struct ReadFileTool;
+#[derive(Debug)]
+pub struct ReadFileTool {
+    attachments: Arc<dyn AttachmentStore>,
+}
+
+impl ReadFileTool {
+    pub fn new(attachments: Arc<dyn AttachmentStore>) -> Self {
+        Self { attachments }
+    }
+}
 
 #[async_trait]
 impl Tool for ReadFileTool {
@@ -47,7 +66,8 @@ impl Tool for ReadFileTool {
             description: "Read a bounded range of a UTF-8 text file. Lines are 1-based and the \
                           range is inclusive. For a file that is one long line, pass byte_offset \
                           (zero-based) instead; the response reports the next offset when \
-                          truncated."
+                          truncated. A PNG, JPEG, WebP, or GIF is returned as an image you can \
+                          see, with a caption naming its dimensions."
                 .to_owned(),
             parameters: json!({
                 "type": "object",
@@ -80,6 +100,14 @@ impl Tool for ReadFileTool {
             )));
         }
 
+        if args.byte_offset.is_none()
+            && args.start_line.is_none()
+            && args.end_line.is_none()
+            && let Some(image) = read_image(&path, ctx.max_image_encoded_bytes, &*self.attachments)?
+        {
+            return Ok(image);
+        }
+
         if let Some(offset) = args.byte_offset {
             if args.start_line.is_some() || args.end_line.is_some() {
                 return Err(ToolError::InvalidArguments(
@@ -92,6 +120,81 @@ impl Tool for ReadFileTool {
 
         read_lines(&path, &args)
     }
+}
+
+/// Return the file as an image when it is one, otherwise `None`.
+///
+/// Only the leading bytes are read first, so a text file costs one small read.
+/// The bytes are then committed to session storage through [`AttachmentStore`],
+/// which is what makes the reference survive resume: the provider reads the file
+/// at request time.
+fn read_image(
+    path: &Path,
+    max_encoded_bytes: usize,
+    attachments: &dyn AttachmentStore,
+) -> Result<Option<ToolOutput>, ToolError> {
+    let mut file = open(path)?;
+    let mut bytes = Vec::new();
+
+    (&mut file)
+        .take(SNIFF_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ToolError::Failed(format!("cannot read {}: {error}", path.display())))?;
+
+    if sniff_image(&bytes).is_none() {
+        if let Some(container) = image_magic(&bytes) {
+            return Err(ToolError::Failed(format!(
+                "{} looks like a {container} image, but its dimensions could not be read from the \
+                 file header",
+                path.display()
+            )));
+        }
+
+        return Ok(None);
+    }
+
+    // The encoded form is what the provider sends, so a file that cannot fit the
+    // limit is refused before it is buffered: the same base64 size rule the
+    // attachment path applies, checked on the length alone.
+    let file_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let total = if bytes.len() == SNIFF_BYTES {
+        file.metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(file_bytes)
+    } else {
+        file_bytes
+    };
+    let encoded = encoded_size(total);
+
+    if encoded > max_encoded_bytes as u64 {
+        return Err(ToolError::Failed(format!(
+            "the base64-encoded image would be {encoded} bytes, above the configured limit of \
+             {max_encoded_bytes} bytes"
+        )));
+    }
+
+    // The whole file is needed for the stored bytes, so the sniff only decides
+    // whether a second read happens.
+    file.read_to_end(&mut bytes)
+        .map_err(|error| ToolError::Failed(format!("cannot read {}: {error}", path.display())))?;
+
+    let image = attachments.store(&bytes, max_encoded_bytes)?;
+    let caption = caption(path, &image);
+    let metadata = json!({
+        "path": path.display().to_string(),
+        "media_type": image.media_type.clone(),
+        "width": image.width,
+        "height": image.height,
+        "bytes": image.bytes,
+        "image": true,
+    });
+
+    Ok(Some(ToolOutput {
+        content: caption,
+        truncated: false,
+        metadata: Some(metadata),
+        images: vec![image],
+    }))
 }
 
 fn read_lines(path: &Path, args: &ReadArgs) -> Result<ToolOutput, ToolError> {
@@ -266,6 +369,7 @@ fn read_lines(path: &Path, args: &ReadArgs) -> Result<ToolOutput, ToolError> {
         content: rendered,
         truncated,
         metadata: Some(metadata),
+        images: Vec::new(),
     })
 }
 
@@ -322,6 +426,7 @@ fn read_bytes(path: &Path, offset: usize) -> Result<ToolOutput, ToolError> {
                 "truncated": false,
                 "next_byte_offset": Value::Null,
             })),
+            images: Vec::new(),
         });
     }
 
@@ -385,6 +490,7 @@ fn read_bytes(path: &Path, offset: usize) -> Result<ToolOutput, ToolError> {
             "truncated": truncated,
             "next_byte_offset": truncated.then_some(next),
         })),
+        images: Vec::new(),
     })
 }
 

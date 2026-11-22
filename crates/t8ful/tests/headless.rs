@@ -69,6 +69,7 @@ impl Project {
             .env("XDG_STATE_HOME", self.home.path().join("state"))
             .env("XDG_CONFIG_DIRS", self.home.path().join("xdg"))
             .env("OPENROUTER_API_KEY", "test-key")
+            .env_remove("OPENCODE_GO_API_KEY")
             .env("T8FUL_BASE_URL", &self.base_url)
             .env("T8FUL_LOG", "off")
             .env_remove("T8FUL_MODEL")
@@ -606,8 +607,10 @@ async fn models_are_listed_as_json() {
     let models: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
 
     assert_eq!(models[0]["id"], json!("vendor/model-a"));
+    assert_eq!(models[0]["provider"], json!("openrouter"));
     assert_eq!(models[0]["context_length"], json!(32000));
     assert_eq!(models[1]["id"], json!("vendor/model-b"));
+    assert_eq!(models[1]["provider"], json!("openrouter"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -627,7 +630,16 @@ async fn models_are_listed_as_text_lines() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("vendor/model-a\tModel A"), "{stdout}");
+    // The provider column is what tells a duplicated id apart in a merged
+    // catalog, so it is headed and populated on every row.
+    assert!(stdout.contains("PROVIDER"), "{stdout}");
+    assert!(stdout.contains("openrouter"), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("vendor/model-a") && line.contains("Model A")),
+        "{stdout}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -672,6 +684,7 @@ async fn a_missing_api_key_is_reported_without_calling_the_provider() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(stderr.contains("OPENROUTER_API_KEY"), "{stderr}");
+    assert!(stderr.contains("OPENCODE_GO_API_KEY"), "{stderr}");
     assert!(server.requests().is_empty());
 }
 
@@ -1625,6 +1638,54 @@ async fn images_are_serialized_and_survive_removing_the_original_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_that_cannot_see_images_refuses_one_a_tool_returned() {
+    // The guard has to look at what the request carries, not just at what a user
+    // message holds: a screenshot read would otherwise be sent to a text-only
+    // model as base64 in a tool message, which is what this feature exists to
+    // avoid.
+    let models = json!({
+        "data": [{
+            "id": "vendor/test-model",
+            "context_length": 32000,
+            "architecture": { "input_modalities": ["text"] }
+        }]
+    })
+    .to_string();
+    let server = FakeServer::start_with_models(
+        vec![
+            Reply::body(tool_stream(
+                "call-1",
+                "read_file",
+                &json!({ "path": "shot.png" }),
+            )),
+            Reply::body(text_stream("should not be called")),
+        ],
+        &models,
+    )
+    .await;
+    let project = Project::new(&server);
+
+    std::fs::write(project.path("shot.png"), test_png(4, 3)).unwrap();
+
+    let output = project
+        .command()
+        .args(["run", "read shot.png"])
+        .output()
+        .expect("text-only model");
+
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(stderr.contains("does not accept image"), "{stderr}");
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the refusal happens before a request carrying the image is sent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_image_models_and_oversized_attachments_fail_clearly() {
     let models = json!({
         "data": [{
@@ -2332,6 +2393,140 @@ async fn a_dangerous_shell_command_runs_without_a_flag() {
                 .as_str()
                 .is_some_and(|content| content.contains("dangerous-ok"))
     }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_file_returns_a_screenshot_the_model_can_see() {
+    // The whole point of image reading: the bytes must reach the model as an
+    // image part in a user message, never as base64 text inside a tool message.
+    let arguments = json!({ "path": "shot.png" });
+    let server = FakeServer::start(vec![
+        Reply::body(tool_stream("call-1", "read_file", &arguments)),
+        Reply::body(text_stream("a red square")),
+    ])
+    .await;
+    let project = Project::new(&server);
+    let png = test_png(40, 30);
+
+    std::fs::write(project.path("shot.png"), &png).unwrap();
+
+    let output = project
+        .command()
+        .args(["run", "read shot.png", "--format", "json"])
+        .output()
+        .expect("read image");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = server.requests();
+
+    assert_eq!(requests.len(), 2, "one call, then one continuation");
+
+    let messages = requests[1].body["messages"].as_array().expect("messages");
+    let tool_messages = messages
+        .iter()
+        .filter(|message| message["role"] == json!("tool"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(tool_messages.len(), 1, "{messages:#?}");
+    assert!(
+        tool_messages[0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("shot.png · image/png · 40x30")),
+        "the tool message keeps the caption: {}",
+        tool_messages[0]
+    );
+    assert!(
+        !tool_messages[0].to_string().contains("image_url"),
+        "a tool message must never carry an image part: {}",
+        tool_messages[0]
+    );
+
+    let image_messages = messages
+        .iter()
+        .filter(|message| message.to_string().contains("image_url"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(image_messages.len(), 1, "{messages:#?}");
+    assert_eq!(image_messages[0]["role"], json!("user"));
+
+    // The image follows the whole tool batch, so the assistant's tool_calls and
+    // every tool reply stay adjacent.
+    let tool_index = messages
+        .iter()
+        .position(|message| message["role"] == json!("tool"))
+        .expect("a tool message");
+    let image_index = messages
+        .iter()
+        .position(|message| message.to_string().contains("image_url"))
+        .expect("an image message");
+
+    assert!(image_index > tool_index, "{messages:#?}");
+
+    // The original screenshot was copied into session storage, so the request
+    // read those bytes rather than the project file.
+    assert!(project.path("shot.png").exists(), "the source is untouched");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_returned_image_survives_a_resumed_session() {
+    // The attachment lives in session state, so a resume that no longer has the
+    // original file still has the pixels.
+    let arguments = json!({ "path": "shot.png" });
+    let server = FakeServer::start(vec![
+        Reply::body(tool_stream("call-1", "read_file", &arguments)),
+        Reply::body(text_stream("seen")),
+    ])
+    .await;
+    let mut project = Project::new(&server);
+
+    std::fs::write(project.path("shot.png"), test_png(8, 6)).unwrap();
+
+    let output = project
+        .command()
+        .args(["run", "read shot.png"])
+        .output()
+        .expect("read image");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let id = session_id(&project);
+
+    std::fs::remove_file(project.path("shot.png")).unwrap();
+
+    let server2 = FakeServer::start(vec![Reply::body(text_stream("still seen"))]).await;
+
+    project.base_url = server2.base_url();
+
+    let output = project
+        .command()
+        .args(["run", "--resume", &id, "again"])
+        .output()
+        .expect("resume image");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = server2.requests();
+    let messages = requests[0].body["messages"].as_array().expect("messages");
+
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.to_string().contains("image_url")),
+        "a resumed tool image stays visible: {messages:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

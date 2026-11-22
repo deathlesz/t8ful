@@ -78,7 +78,7 @@ impl Assembler {
             // it gets the same classification. Frames without a usable status
             // stay unclassified rather than guessing one.
             return Err(match status {
-                Some(status) => crate::client::status_error(status, message, None),
+                Some(status) => crate::error::status_error(status, message, None),
                 None => t8ful_core::ProviderError::Other(format!(
                     "provider reported an error: {message}"
                 )),
@@ -139,21 +139,7 @@ impl Assembler {
         }
 
         if let Some(usage) = chunk.usage {
-            let usage = Usage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-                cache_read_tokens: usage.cache_read_tokens.or_else(|| {
-                    usage
-                        .prompt_tokens_details
-                        .and_then(|details| details.cached_tokens)
-                }),
-                cache_write_tokens: usage.cache_write_tokens,
-                reasoning_tokens: usage
-                    .completion_tokens_details
-                    .and_then(|details| details.reasoning_tokens),
-                cost_usd: usage.cost.or(usage.total_cost).map(|cost| cost.to_string()),
-                generation_id: usage.generation_id.map(GenerationId::from),
-            };
+            let usage = usage.into_usage();
 
             if !usage.is_empty() {
                 events.push(ProviderEvent::Usage(usage));
@@ -391,6 +377,75 @@ struct UsagePayload {
     total_cost: Option<serde_json::Number>,
     #[serde(default)]
     generation_id: Option<String>,
+    /// OpenCode Go's billing block. Its token counts are used only where the
+    /// OpenAI fields are absent, so a provider that sends both cannot be
+    /// double-counted.
+    #[serde(default)]
+    opencode: Option<OpencodeUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpencodeUsage {
+    /// How Go billed this turn (`subscription`, `payg`, …). Kept so the field
+    /// is parsed and documented; t8ful records the cost, not the source.
+    #[serde(default, rename = "billing_source")]
+    _billing_source: Option<String>,
+    #[serde(default)]
+    tokens: Option<OpencodeTokens>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpencodeTokens {
+    #[serde(default)]
+    input: Option<u64>,
+    #[serde(default)]
+    output: Option<u64>,
+    #[serde(default)]
+    reasoning: Option<u64>,
+    #[serde(default)]
+    cache_read: Option<u64>,
+    /// Five-minute prompt-cache writes. t8ful reports one cache-write count, so
+    /// this is the value the longer-lived tier falls back from.
+    #[serde(default)]
+    cache_write_5m: Option<u64>,
+    /// One-hour prompt-cache writes, used only when no five-minute count exists.
+    #[serde(default)]
+    cache_write_1h: Option<u64>,
+}
+
+impl UsagePayload {
+    fn into_usage(self) -> Usage {
+        let tokens = self
+            .opencode
+            .as_ref()
+            .and_then(|block| block.tokens.as_ref());
+        let token = |pick: fn(&OpencodeTokens) -> Option<u64>| tokens.and_then(pick);
+        let cache_write = self
+            .cache_write_tokens
+            .or_else(|| token(|tokens| tokens.cache_write_5m))
+            .or_else(|| token(|tokens| tokens.cache_write_1h));
+
+        Usage {
+            input_tokens: self.prompt_tokens.or_else(|| token(|tokens| tokens.input)),
+            output_tokens: self
+                .completion_tokens
+                .or_else(|| token(|tokens| tokens.output)),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .or_else(|| {
+                    self.prompt_tokens_details
+                        .and_then(|details| details.cached_tokens)
+                })
+                .or_else(|| token(|tokens| tokens.cache_read)),
+            cache_write_tokens: cache_write,
+            reasoning_tokens: self
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens)
+                .or_else(|| token(|tokens| tokens.reasoning)),
+            cost_usd: self.cost.or(self.total_cost).map(|cost| cost.to_string()),
+            generation_id: self.generation_id.map(GenerationId::from),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -4,6 +4,17 @@ use std::path::PathBuf;
 
 use crate::config::EnvSource;
 
+/// Canonical spelling of a provider name the driver accepts.
+///
+/// `/login` and `/logout` take the id `auth.json` and the catalogs use, so
+/// `opencode` becomes `opencode-go` and everything else names OpenRouter.
+pub fn canonical_provider(provider: &str) -> &'static str {
+    match crate::auth::environment_variable(provider) {
+        Some("OPENCODE_GO_API_KEY") => crate::auth::OPENCODE_GO,
+        _ => crate::auth::OPENROUTER,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatePaths {
     pub root: PathBuf,

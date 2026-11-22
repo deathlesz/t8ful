@@ -121,6 +121,7 @@ impl Tool for ProcessOutputTool {
             content,
             truncated,
             metadata: Some(self.processes.describe(&args.process_id)?),
+            images: Vec::new(),
         })
     }
 }
@@ -180,6 +181,7 @@ impl Tool for ProcessStatusTool {
             content,
             truncated: false,
             metadata: Some(self.processes.describe(&args.process_id)?),
+            images: Vec::new(),
         })
     }
 }
@@ -246,6 +248,7 @@ impl Tool for ProcessListTool {
                     .map(|process| process.id.clone())
                     .collect::<Vec<_>>(),
             })),
+            images: Vec::new(),
         })
     }
 }
@@ -327,6 +330,7 @@ impl Tool for ProcessWaitTool {
             content,
             truncated: false,
             metadata: Some(metadata),
+            images: Vec::new(),
         })
     }
 }
@@ -428,6 +432,7 @@ impl Tool for ProcessStopTool {
             ),
             truncated: false,
             metadata: Some(self.processes.describe(&args.process_id)?),
+            images: Vec::new(),
         })
     }
 }

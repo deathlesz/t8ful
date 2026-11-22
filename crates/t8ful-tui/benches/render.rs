@@ -387,6 +387,7 @@ fn transcript() -> AppState {
                 preview: ToolPreview::default(),
                 duration: None,
                 placement: Default::default(),
+                images: Vec::new(),
             },
             _ => Entry::User(format!("prompt {index} with a little more text to wrap")),
         })
